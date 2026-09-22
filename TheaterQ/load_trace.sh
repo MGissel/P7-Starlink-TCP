@@ -1,12 +1,13 @@
 #!/bin/bash
 # load_trace.sh — Clear existing TheaterQ trace entries and ingest a new CSV.
-# Usage: ./load_trace.sh <path-to-trace.csv> [interface] [handle]
+# Usage: ./load_trace.sh <path-to-trace.csv> [interface] [handle] [format:SIMPLE|EXTENDED]
 
 set -euo pipefail
 
-TRACE_FILE="${1:?Usage: $0 <path-to-trace.csv> [interface] [handle]}"
+TRACE_FILE="${1:?Usage: $0 <path-to-trace.csv> [interface] [handle] [format:SIMPLE|EXTENDED]}"
 IFACE="${2:-lo}"
 HANDLE="${3:-1:}"
+FORMAT="${4:-EXTENDED}"
 DEV_PATH="/dev/theaterq:${IFACE}:${HANDLE%:}:0"
 
 if [[ ! -f "$TRACE_FILE" ]]; then
@@ -14,8 +15,8 @@ if [[ ! -f "$TRACE_FILE" ]]; then
     exit 1
 fi
 
-echo ">> Clearing existing trace on dev $IFACE handle $HANDLE"
-sudo tc qdisc change dev "$IFACE" root handle "$HANDLE" theaterq stage CLEAR
+echo ">> Clearing existing trace on dev $IFACE handle $HANDLE (format $FORMAT)"
+sudo tc qdisc replace dev "$IFACE" root handle "$HANDLE" theaterq stage CLEAR ingest "$FORMAT"
 
 echo ">> Ingesting $TRACE_FILE into $DEV_PATH"
 sudo bash -c "cat '$TRACE_FILE' > '$DEV_PATH'"
@@ -23,7 +24,7 @@ sudo bash -c "cat '$TRACE_FILE' > '$DEV_PATH'"
 echo ">> Current qdisc state:"
 tc qdisc show dev "$IFACE"
 
-sudo tc qdisc change dev lo root handle 1: theaterq stage RUN cont LOOP
+sudo tc qdisc replace dev "$IFACE" root handle "$HANDLE" theaterq stage RUN cont LOOP
 
 echo ""
 echo "Trace loaded. To start playback, run:"
