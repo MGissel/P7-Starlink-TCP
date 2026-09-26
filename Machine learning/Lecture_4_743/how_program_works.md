@@ -52,4 +52,4 @@ the `p_list` variable is a propability matrix where each row represents data poi
 
 In the end the accuracy of the label assignment is calculated and then the accuracy of the label assignment is calculated as a percentage.
 
-**The program is not done**
+**The program is now done**
