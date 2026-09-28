@@ -1,3 +1,14 @@
+# ###################################
+# Group ID : 743
+# Members : Cristian M. Ion, Frederik B. B. Jepesen, Ib L. M. Nielsen, Mathias M. Gissel
+# Date : September 28
+# Lecture: 4 Introduction to Machine Learning
+# Dependencies: numpy, matplotlib, sklearn, scipy 
+# Python version: 3.14.3
+# Functionality: Short Description. This script uses PCA and LDA transormation 
+# to reduce 784 dims to 2 dims and classifies into classes, with accuracy and error rate. 
+# ###################################
+
 #Do exercise:  from the 10-class database, choose three classes (5, 6 and 8) and then reduce dimension to 2 using LDA.  
 #Since we are working on images we will normalize by dividing by 255
 
@@ -9,9 +20,9 @@ from scipy.stats import multivariate_normal as mvn
 from scipy.stats import norm
 
 def pca_transform(classes, dt, dim, pca = None):
-    class0 = np.loadtxt(f"ex03/mnist_all/{dt}{classes[0]}.txt") / 255
-    class1 = np.loadtxt(f"ex03/mnist_all/{dt}{classes[1]}.txt") / 255
-    class2 = np.loadtxt(f"ex03/mnist_all/{dt}{classes[2]}.txt") / 255
+    class0 = np.loadtxt(f"mnist_all/{dt}{classes[0]}.txt") / 255
+    class1 = np.loadtxt(f"mnist_all/{dt}{classes[1]}.txt") / 255
+    class2 = np.loadtxt(f"mnist_all/{dt}{classes[2]}.txt") / 255
 
     #Labels are not used, but makes it easier to compute stuff later, so ive kept them
     labels = np.concatenate([0*np.ones(len(class0), dtype=int), 1*np.ones(len(class1), dtype=int), 2*np.ones(len(class2), dtype=int)])
@@ -26,9 +37,9 @@ def pca_transform(classes, dt, dim, pca = None):
 
 
 def lda_transform(classes, dt, dim, clf=None):
-    class0 = np.loadtxt(f"ex03/mnist_all/{dt}{classes[0]}.txt") / 255
-    class1 = np.loadtxt(f"ex03/mnist_all/{dt}{classes[1]}.txt") / 255
-    class2 = np.loadtxt(f"ex03/mnist_all/{dt}{classes[2]}.txt") / 255
+    class0 = np.loadtxt(f"mnist_all/{dt}{classes[0]}.txt") / 255
+    class1 = np.loadtxt(f"mnist_all/{dt}{classes[1]}.txt") / 255
+    class2 = np.loadtxt(f"mnist_all/{dt}{classes[2]}.txt") / 255
 
     labels = np.concatenate([0*np.ones(len(class0), dtype=int), 1*np.ones(len(class1), dtype=int), 2*np.ones(len(class2), dtype=int)])
     data = np.concatenate([class0, class1, class2])
@@ -105,12 +116,23 @@ if dim == 2:
         train_data_lda, train_labels, clf = lda_transform(classes, dt, dim, clf)
         train_data_pca, _, pca = pca_transform(classes, dt, dim, pca)
 
-        for i in range(len(classes)):
+
+        
+        for i in range(len(classes)):   
             class_transform_lda = train_data_lda[train_labels == labels[i]]
             class_transform_pca = train_data_pca[train_labels == labels[i]]
 
+            ax[0, index].set_title(f'{dt} LDA')
             ax[0, index].scatter(class_transform_lda[:,0], class_transform_lda[:,1], label=f"lda class {classes[i]}, type {dt}")
             ax[0, index].legend()
+
+            ax[1, index].set_title(f'{dt} PCA')
             ax[1, index].scatter(class_transform_pca[:,0], class_transform_pca[:,1], label=f"pca class {classes[i]}, type {dt}")
             ax[1, index].legend()
+    plt.tight_layout()
     plt.show()
+
+"""
+Classification accuracy 0.9444050991501416: Error/Misclassification rate 0.05559490084985841 for LDA
+Classification accuracy 0.7103399433427762: Error/Misclassification rate 0.28966005665722383 for PCA
+"""
