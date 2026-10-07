@@ -1,6 +1,7 @@
 from measurement_tool import MeasurementTool
 import json
 import subprocess
+from pathlib import Path
 
 class Iperf3(MeasurementTool):
     """Implementation of the MeasurementTool interface for iperf3."""
@@ -48,13 +49,39 @@ class Iperf3(MeasurementTool):
             if value == "true":
                 test_parameters.append(flag)
 
-        result = subprocess.run(
-            test_parameters,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        self.test_data[test_name] = json.loads(result.stdout)
+        try:
+            result = subprocess.run(
+                test_parameters,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as error:
+            print(f"iperf3 failed: {error.stderr.strip()}")
+            return 1
+
+        output = result.stdout
+        logfile = self.parameters.get("logfile")
+        if logfile:
+            output = Path(logfile).read_text()
+
+        try:
+            decoder = json.JSONDecoder()
+            position = 0
+            parsed_output = None
+            while position < len(output):
+                while position < len(output) and output[position].isspace():
+                    position += 1
+                if position >= len(output):
+                    break
+                parsed_output, end = decoder.raw_decode(output, position)
+                position = end
+            if parsed_output is None:
+                raise json.JSONDecodeError("empty output", output, 0)
+            self.test_data[test_name] = parsed_output
+        except json.JSONDecodeError:
+            print("iperf3 did not produce valid JSON output")
+            return 1
         return 0
 
     def getTestData(self, test_name: str) -> dict:
