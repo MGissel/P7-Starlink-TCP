@@ -1,16 +1,9 @@
 import subprocess
+import platform
 from datetime import datetime, timezone
 from measurement_tool import MeasurementTool
 
-"""
-for running the ss in Windows terminal: wsl.exe -d Debian -- ss -s 
-wsl.exe for linux launcher, -d Debian it specify that you are using distribution debian
-use -- to separates wsl options from commands
-after -- you can use any ss command
 
-for linux just type in the command
-i will modify it later to work on all machines
-"""
 class SS(MeasurementTool):
     """Collect Linux socket statistics through WSL."""
 
@@ -24,19 +17,26 @@ class SS(MeasurementTool):
         return 0
 
     def runTest(self, test_name: str) -> int:
-        """Run ss -s inside Debian WSL."""
+        system = platform.system()
 
+        if system == "Windows":
+            command = ["wsl.exe", "-d", self.distro, "--", "ss", "-s"]
+        elif system in ("Linux"):
+            command = ["ss", "-s"]
+        else:
+            print("Unsupported OS")
+            return 1
         try:
             result = subprocess.run(
                 [
                     "wsl.exe",
                     "-d", self.distro,
-                    "--",
+                    " ",
                     "ss", "-s"
                 ],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=20
             )
 
             if result.returncode != 0:
