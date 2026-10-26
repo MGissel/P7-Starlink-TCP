@@ -1,4 +1,5 @@
 import inspect
+from pathlib import Path
 
 from iperf3 import Iperf3
 from TQ import TQ
@@ -154,18 +155,19 @@ sudo("ip", "netns", "exec", namespace,
     "ping", "-c", "1", "-W", "1", "10.200.0.1")
 
 import time
-#t = "../TheaterQ/Traces/theaterQ_traces/20260319_mixed_losssampling_eval_dl50.trace"
-t = "../TheaterQ/Traces/test_trace.csv"
+# Keep the trace path independent of the directory used to launch this script.
+#t = Path(__file__).resolve().parent.parent / "TheaterQ" / "Traces" / "theaterQ_traces" / "20260319_mixed_losssampling_eval_dl50.trace"
+t = Path(__file__).resolve().parent.parent / "TheaterQ" / "Traces" / "test_trace.csv"
+print(f"Using trace file: {t}")
 theaterq = TQ()
 theaterq.setParamters(
     trace=t,
     interface=host_interface,
     handle="1:",
-    format="EXTENDED",
+    format="SIMPLE",
     stage="ARM",
     cont="LOOP",
 )
-
 if theaterq.runTest("network_test") != 0:
     raise RuntimeError("TheaterQ setup failed")
 
