@@ -20,9 +20,7 @@ class SS(MeasurementTool):
     def runTest(self, test_name: str) -> int:
         system = platform.system()
 
-        if system == "Windows":
-            command = ["wsl.exe", "-d", self.distro, "--", "ss", "-s"]
-        elif system == "Linux":
+        if system == "Linux":
             command = ["ss", "-s"]
         else:
             print(f"Unsupported OS: {system}")
