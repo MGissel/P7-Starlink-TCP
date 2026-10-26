@@ -1,3 +1,4 @@
+
 import subprocess
 import platform
 from datetime import datetime, timezone
@@ -5,14 +6,14 @@ from measurement_tool import MeasurementTool
 
 
 class SS(MeasurementTool):
-    """Collect Linux socket statistics through WSL."""
+    """Collect Linux socket statistics."""
 
     def __init__(self):
         self.distro = "Debian"
         self.test_data = {}
 
     def setParamters(self, **kwargs) -> int:
-        """Configure the WSL distribution."""
+        """Configure the WSL distribution if running on Windows."""
         self.distro = kwargs.get("distro", self.distro)
         return 0
 
@@ -21,19 +22,15 @@ class SS(MeasurementTool):
 
         if system == "Windows":
             command = ["wsl.exe", "-d", self.distro, "--", "ss", "-s"]
-        elif system in ("Linux"):
+        elif system == "Linux":
             command = ["ss", "-s"]
         else:
-            print("Unsupported OS")
+            print(f"Unsupported OS: {system}")
             return 1
+
         try:
             result = subprocess.run(
-                [
-                    "wsl.exe",
-                    "-d", self.distro,
-                    " ",
-                    "ss", "-s"
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=20
@@ -46,14 +43,14 @@ class SS(MeasurementTool):
             self.test_data[test_name] = {
                 "test_name": test_name,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "command": "ss -s",
+                "command": " ".join(command),
                 "statistics": result.stdout.strip()
             }
 
             return 0
 
         except FileNotFoundError:
-            print("Error: wsl.exe was not found.")
+            print(f"Error: command not found: {command[0]}")
             return 1
 
         except subprocess.TimeoutExpired:

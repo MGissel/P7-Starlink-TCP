@@ -5,7 +5,7 @@ from TQ import TQ
 import configparser
 import json
 from datetime import datetime, timedelta, timezone
-
+from ss import SS
 
 class main:
     TOOLS = [
@@ -30,6 +30,8 @@ class main:
             match tool:
                 case "iperf":
                       self._setup_iperf3()
+                case "ss":
+                      self._setup_ss()
         from DB import DB
 
         self.db = DB()
@@ -38,12 +40,23 @@ class main:
         self.iperf3_tool = Iperf3()
         self.iperf3_tool.setParamters(**self.config_dict.get('iperf_client', {}))
 
+    def _setup_ss(self):
+        self.ss_tool = SS()
+        self.ss_tool.setParamters(**self.config_dict.get("ss", {}))
+
     def _run_iperf3_test(self, test_name="example_test"):
         status = self.iperf3_tool.runTest(test_name)
         if status == 0:
             print(json.dumps(self.iperf3_tool.getTestData(test_name), indent=2))
         else:
             print("iperf3 test failed")
+
+    def _run_ss_test(self, test_name="example_test"):
+        status = self.ss_tool.runTest(test_name)
+        if status == 0:
+            print(json.dumps(self.ss_tool.getTestData(test_name), indent=2))
+        else:
+            print("ss test failed")
 
     def query_db(self, query, params=None):
         return self.db.query(query, params)
@@ -94,6 +107,8 @@ class main:
     def run_tests(self, test_name="example_test"):
         if "iperf" in self.tools:
             self._run_iperf3_test(test_name)
+        if "ss" in self.tools:
+            self._run_ss_test(test_name)
 
 import subprocess
 import time
@@ -146,7 +161,7 @@ theaterq.setParamters(
     trace=t,
     interface=host_interface,
     handle="1:",
-    format="SIMPLE",
+    format="EXTENDED",
     stage="ARM",
     cont="LOOP",
 )
