@@ -1,3 +1,6 @@
+import json
+from datetime import datetime, timedelta, timezone
+
 import psycopg
 
 class DB:
@@ -59,6 +62,43 @@ class DB:
                 result = None
         self.conn.commit()
         return result
+
+    def save_iperf_test(self, test_data, cca, parameters):
+        """Persist one iperf3 run and all of its interval stream results."""
+        if not test_data:
+            raise ValueError("Cannot save an empty iperf3 result")
+
+        test_id = self.query(
+            """
+            INSERT INTO tests (cca, parms)
+            VALUES (%s, %s)
+            RETURNING id
+            """,
+            (cca, json.dumps(parameters)),
+        )[0][0]
+
+        timestamp = test_data.get("start", {}).get("timestamp", {}).get("timesecs")
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc).timestamp()
+        test_start = datetime.fromtimestamp(timestamp, timezone.utc)
+
+        for interval in test_data.get("intervals", []):
+            interval_time = test_start + timedelta(seconds=interval.get("end", 0))
+            for result in interval.get("streams", []):
+                self.query(
+                    """
+                    INSERT INTO results (test_id, t, throughput, rtt_ms, cwnd, retrans)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        test_id,
+                        interval_time,
+                        result.get("bits_per_second"),
+                        result.get("rtt"),
+                        result.get("snd_cwnd"),
+                        result.get("retransmits"),
+                    ),
+                )
 
     def close(self):
         self.conn.close()

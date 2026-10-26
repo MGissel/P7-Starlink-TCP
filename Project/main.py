@@ -1,209 +1,93 @@
-import inspect
-from pathlib import Path
-
-from iperf3 import Iperf3
-from TQ import TQ
 import configparser
 import json
-from datetime import datetime, timedelta, timezone
+import time
+from pathlib import Path
+
+from TQ import TQ
+from iperf3 import Iperf3
+from network import NetworkNamespace
 from ss import SS
 
-class main:
-    TOOLS = [
-          "iperf",
-          "ss"
-    ]
 
-    def __init__(self, config_file='config.ini'):
-        self._load_config(config_file)
-        self._setup_tools()
+class Experiment:
+    """Load project configuration and run the configured measurements."""
 
-    def _load_config(self, config_file):
-        config = configparser.ConfigParser()
-        config.read(config_file)
-        self.config_dict = {section: dict(config.items(section)) for section in config.sections()}
+    SUPPORTED_TOOLS = {"iperf": Iperf3, "ss": SS}
 
-    def _setup_tools(self):
-        self.tools = self.config_dict["global_test_settings"]["tools"].split(", ")
-        for tool in self.tools:
-            if tool not in self.TOOLS:
-                raise ValueError(f"Unsupported tool: {tool}")
-            match tool:
-                case "iperf":
-                      self._setup_iperf3()
-                case "ss":
-                      self._setup_ss()
+    def __init__(self, config_file: str | Path = Path(__file__).with_name("config.ini")):
+        self.config = self._load_config(config_file)
+        self.tools = self._create_tools()
+
+    @staticmethod
+    def _load_config(config_file: str | Path) -> dict[str, dict[str, str]]:
+        parser = configparser.ConfigParser()
+        if not parser.read(config_file):
+            raise FileNotFoundError(f"Configuration file not found: {config_file}")
+        return {section: dict(parser.items(section)) for section in parser.sections()}
+
+    def _create_tools(self) -> dict[str, Iperf3 | SS]:
+        configured_tools = self.config["global_test_settings"]["tools"].split(",")
+        tools = {}
+        for name in (tool.strip() for tool in configured_tools):
+            tool_type = self.SUPPORTED_TOOLS.get(name)
+            if tool_type is None:
+                raise ValueError(f"Unsupported tool: {name}")
+            tool = tool_type()
+            tool.setParamters(**self.config.get(f"{name}_client", self.config.get(name, {})))
+            tools[name] = tool
+        return tools
+
+    def run_tools(self, test_name: str) -> None:
+        for name, tool in self.tools.items():
+            status = tool.runTest(test_name)
+            if status != 0:
+                raise RuntimeError(f"{name} test failed")
+            print(json.dumps(tool.getTestData(test_name), indent=2))
+
+    def save_iperf_result(self, test_name: str) -> None:
+        iperf = self.tools.get("iperf")
+        if not isinstance(iperf, Iperf3):
+            return
         from DB import DB
 
-        self.db = DB()
-
-    def _setup_iperf3(self):
-        self.iperf3_tool = Iperf3()
-        self.iperf3_tool.setParamters(**self.config_dict.get('iperf_client', {}))
-
-    def _setup_ss(self):
-        self.ss_tool = SS()
-        self.ss_tool.setParamters(**self.config_dict.get("ss", {}))
-
-    def _run_iperf3_test(self, test_name="example_test"):
-        status = self.iperf3_tool.runTest(test_name)
-        if status == 0:
-            print(json.dumps(self.iperf3_tool.getTestData(test_name), indent=2))
-        else:
-            print("iperf3 test failed")
-
-    def _run_ss_test(self, test_name="example_test"):
-        status = self.ss_tool.runTest(test_name)
-        if status == 0:
-            print(json.dumps(self.ss_tool.getTestData(test_name), indent=2))
-        else:
-            print("ss test failed")
-
-    def query_db(self, query, params=None):
-        return self.db.query(query, params)
-
-    def save_test_to_db(self, test_name):
-        test_data = self.iperf3_tool.getTestData(test_name)
-        if not test_data:
-            print(f"No data found for test: {test_name}")
-            return
-
-        # Each execution is a separate test, even when its configuration is identical.
-        test_id = self.query_db(
-            """
-            INSERT INTO tests (cca, parms)
-            VALUES (%s, %s)
-            RETURNING id
-            """,
-            (
-                self.config_dict["global_test_settings"]["cca"],
-                json.dumps(self.config_dict["iperf_client"]),
-            ),
-        )[0][0]
-
-        # Insert one result for every interval and stream, not only the final summary.
-        timestamp = test_data.get("start", {}).get("timestamp", {}).get("timesecs")
-        if timestamp is None:
-            timestamp = datetime.now(timezone.utc).timestamp()
-        test_start = datetime.fromtimestamp(timestamp, timezone.utc)
-
-        for interval in test_data.get("intervals", []):
-            interval_time = test_start + timedelta(seconds=interval.get("end", 0))
-            for result in interval.get("streams", []):
-                self.query_db(
-                    """
-                    INSERT INTO results (test_id, t, throughput, rtt_ms, cwnd, retrans)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        test_id,
-                        interval_time,
-                        result.get("bits_per_second"),
-                        result.get("rtt"),
-                        result.get("snd_cwnd"),
-                        result.get("retransmits")
-                    )
-                )
-
-    def run_tests(self, test_name="example_test"):
-        if "iperf" in self.tools:
-            self._run_iperf3_test(test_name)
-        if "ss" in self.tools:
-            self._run_ss_test(test_name)
-
-import subprocess
-import time
-from TQ import TQ
+        with DB() as database:
+            database.save_iperf_test(
+                iperf.getTestData(test_name),
+                self.config["global_test_settings"]["cca"],
+                self.config.get("iperf_client", {}),
+            )
 
 
-def sudo(*arguments):
-    subprocess.run(["sudo", *arguments], check=True)
+def run_network_test() -> None:
+    project_root = Path(__file__).resolve().parent.parent
+    network = NetworkNamespace()
+    network.setup()
 
-
-namespace = "tq-client"
-host_interface = "tq-host"
-client_interface = "tq-peer"
-
-subprocess.run(
-    ["sudo", "ip", "netns", "delete", namespace],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    check=False,
-)
-sudo("ip", "netns", "add", namespace)
-
-sudo("ip", "link", "add", host_interface,
-        "type", "veth", "peer", "name", client_interface)
-
-sudo("ip", "link", "set", client_interface, "netns", namespace)
-
-sudo("ip", "addr", "add", "10.200.0.1/24", "dev", host_interface)
-sudo("sysctl", "-w", f"net.ipv6.conf.{host_interface}.disable_ipv6=1")
-sudo("ip", "link", "set", host_interface, "up")
-
-sudo("ip", "netns", "exec", namespace,
-        "ip", "addr", "add", "10.200.0.2/24", "dev", client_interface)
-sudo("ip", "netns", "exec", namespace,
-    "sysctl", "-w", f"net.ipv6.conf.{client_interface}.disable_ipv6=1")
-sudo("ip", "netns", "exec", namespace,
-        "ip", "link", "set", client_interface, "up")
-sudo("ip", "netns", "exec", namespace,
-        "ip", "link", "set", "lo", "up")
-
-# Resolve the veth neighbor before TheaterQ is armed; otherwise ARP can trigger ARM.
-sudo("ip", "netns", "exec", namespace,
-    "ping", "-c", "1", "-W", "1", "10.200.0.1")
-
-import time
-# Keep the trace path independent of the directory used to launch this script.
-#t = Path(__file__).resolve().parent.parent / "TheaterQ" / "Traces" / "theaterQ_traces" / "20260319_mixed_losssampling_eval_dl50.trace"
-t = Path(__file__).resolve().parent.parent / "TheaterQ" / "Traces" / "test_trace.csv"
-print(f"Using trace file: {t}")
-theaterq = TQ()
-theaterq.setParamters(
-    trace=t,
-    interface=host_interface,
-    handle="1:",
-    format="SIMPLE",
-    stage="ARM",
-    cont="LOOP",
-)
-if theaterq.runTest("network_test") != 0:
-    raise RuntimeError("TheaterQ setup failed")
-
-print("TheaterQ setup completed successfully. Running main tests...")
-
-server = subprocess.Popen([
-    "sudo", "ip", "netns", "exec", namespace, "iperf3", "-s",
-], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-
-try:
-    time.sleep(1)
-    if server.poll() is not None:
-        server_error = server.stderr.read().strip()
-        raise RuntimeError(f"iperf3 server failed: {server_error or 'no error output'}")
-    """
-    result = subprocess.run(
-        ["iperf3", "-c", "10.200.0.2", "-t", "5", "--json"],
-        capture_output=True,
-        text=True,
-        check=False,
+    theaterq = TQ()
+    theaterq.setParamters(
+        trace=project_root / "TheaterQ" / "Traces" / "test_trace.csv",
+        interface=network.host_interface,
+        handle="1:",
+        format="SIMPLE",
+        stage="ARM",
+        cont="LOOP",
     )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"iperf3 failed (exit {result.returncode}): "
-            f"{result.stderr.strip() or 'no error output'}"
-        )
-    print(json.dumps(json.loads(result.stdout), indent=2))"""
-    time.sleep(60)
-finally:
-    server.terminate()
-    try:
-        server.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        server.kill()
+    if theaterq.runTest("network_test") != 0:
+        raise RuntimeError("TheaterQ setup failed")
 
-exit(0)
-test = main()
-test.run_tests("test_2")
-test.save_test_to_db("test_2")
+    print("TheaterQ setup completed successfully. Running main tests...")
+    with network.iperf_server() as server:
+        time.sleep(1)
+        network.ensure_process_started(server)
+        time.sleep(5)
+
+
+def main() -> None:
+    run_network_test()
+    experiment = Experiment()
+    experiment.run_tools("test_2")
+    experiment.save_iperf_result("test_2")
+
+
+if __name__ == "__main__":
+    main()
