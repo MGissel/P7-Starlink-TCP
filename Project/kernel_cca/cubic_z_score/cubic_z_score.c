@@ -30,7 +30,8 @@
 #include <linux/module.h>
 #include <linux/math64.h>
 #include <net/tcp.h>
-//#include </lib/modules/7.0.0-34-generic>
+#include <linux/types.h>
+
 
 #define BICTCP_BETA_SCALE    1024	/* Scale factor beta calculation
 					 * max_cwnd = snd_cwnd * beta
@@ -107,9 +108,10 @@ struct bictcp {
 	u32	end_seq;	/* end_seq of the round */
 	u32	last_ack;	/* last time when the ACK spacing is close */
 	u32	curr_rtt;	/* the minimum rtt of current round */
-	int curr_z;
+	s32 curr_z;
 	u32 counter;
-	int status;
+	u32 bic_target;
+	u32 last_max_cwnd_z;
 };
 
 
@@ -291,10 +293,11 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd, u32 acked)
 	delta = (cube_rtt_scale * offs * offs * offs) >> (10+3*BICTCP_HZ); //same as C(t-K)³
 	//printk(KERN_DEBUG "RTT: {%d}, CWND {%d}", delta, cwnd);
 	if (t < ca->bic_K)                            /* below origin*/
-		bic_target = ca->bic_origin_point - delta;
+		bic_target = ca->bic_origin_point - delta; //Origin point = w_last 
 	else                                          /* above origin*/
 		bic_target = ca->bic_origin_point + delta; //W(t)
 
+	ca->bic_target = bic_target;
 	/* cubic function - calc bictcp_cnt*/
 	if (bic_target > cwnd) {
 		ca->cnt = cwnd / (bic_target - cwnd);
@@ -378,7 +381,7 @@ static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 	
 
-	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%d, Status,%d", tp->srtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), ca->curr_z, ca->status);
+	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%d, Bictarget,%u", tp->srtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), ca->curr_z, ca->bic_target);
 	//ca->status = 0;
 	if (!tcp_is_cwnd_limited(sk))
 		return;
@@ -389,7 +392,7 @@ static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 			return;
 	}
 	bictcp_update(ca, tcp_snd_cwnd(tp), acked);
-	tcp_cong_avoid_ai(tp, ca->cnt, acked); //What does this do compared to the other avoid function?
+	tcp_cong_avoid_ai(tp, ca->cnt, acked); //Additive increase? where is this function
 }
 
 __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
@@ -420,17 +423,27 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 	struct bictcp *ca = inet_csk_ca(sk);
 
 
-	
+	if (ca->curr_z >= z_score_threshold){
+		if (ca->last_max_cwnd_z < ca->last_cwnd){
+			ca->last_max_cwnd_z = ca->last_cwnd;
+			return ca->last_max_cwnd_z;
+		}
+		
+		else{
+			return ca->last_max_cwnd_z;
+		}
+		
+	}
+	else {
+		ca->epoch_start = 0;	/* end of epoch */ //Tells update to recalc a new bic_target
+		/* Wmax and fast convergence */
+		if (tcp_snd_cwnd(tp) < ca->last_max_cwnd && fast_convergence)
+			ca->last_max_cwnd = (tcp_snd_cwnd(tp) * (BICTCP_BETA_SCALE + beta))/ (2 * BICTCP_BETA_SCALE);
+		else
+			ca->last_max_cwnd = tcp_snd_cwnd(tp); //TEST HERE
 
-	ca->epoch_start = 0;	/* end of epoch */
-	/* Wmax and fast convergence */
-	if (tcp_snd_cwnd(tp) < ca->last_max_cwnd && fast_convergence)
-		ca->last_max_cwnd = (tcp_snd_cwnd(tp) * (BICTCP_BETA_SCALE + beta))/ (2 * BICTCP_BETA_SCALE);
-	else
-		ca->last_max_cwnd = tcp_snd_cwnd(tp); //TEST HERE
-
-	return max((tcp_snd_cwnd(tp) * beta) / BICTCP_BETA_SCALE, 2U);
-	
+		return max((tcp_snd_cwnd(tp) * beta) / BICTCP_BETA_SCALE, 2U);
+	}
 	
 }
 
