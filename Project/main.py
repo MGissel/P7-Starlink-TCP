@@ -58,14 +58,13 @@ class Experiment:
             )
 
 
-def run_network_test() -> None:
+def setup_network_and_theaterq() -> None:
     project_root = Path(__file__).resolve().parent.parent
     network = NetworkNamespace()
     network.setup()
-
     theaterq = TQ()
     theaterq.setParamters(
-        trace=project_root / "TheaterQ" / "Traces" / "test_trace.csv",
+        trace=project_root / "Project" / "TheaterQ_Traces" / "20260319_mixed_losssampling_eval_dl50.trace",
         interface=network.host_interface,
         handle="1:",
         format="SIMPLE",
@@ -76,6 +75,7 @@ def run_network_test() -> None:
         raise RuntimeError("TheaterQ setup failed")
 
     print("TheaterQ setup completed successfully. Running main tests...")
+    return network
     with network.iperf_server() as server:
         time.sleep(1)
         network.ensure_process_started(server)
@@ -83,10 +83,15 @@ def run_network_test() -> None:
 
 
 def main() -> None:
-    run_network_test()
-    experiment = Experiment()
-    experiment.run_tools("test_2")
-    experiment.save_iperf_result("test_2")
+    network = setup_network_and_theaterq()
+
+    with network.iperf_server() as server:
+        time.sleep(1)
+        network.ensure_process_started(server)
+
+        experiment = Experiment()
+        experiment.run_tools("test_2")
+        experiment.save_iperf_result("test_2")
 
 
 if __name__ == "__main__":

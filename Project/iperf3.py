@@ -17,6 +17,7 @@ class Iperf3(MeasurementTool):
         "parallel": "-P",
         "omit": "-O",
         "logfile": "--logfile",
+        "cca": "-C",
     }
     BOOLEAN_FLAGS = {
         "json": "--json",

@@ -68,6 +68,15 @@ class DB:
         if not test_data:
             raise ValueError("Cannot save an empty iperf3 result")
 
+        self.query(
+            """
+            INSERT INTO cca (name)
+            VALUES (%s)
+            ON CONFLICT (name) DO NOTHING
+            """,
+            (cca,),
+        )
+
         test_id = self.query(
             """
             INSERT INTO tests (cca, parms)
