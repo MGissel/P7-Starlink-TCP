@@ -1,6 +1,7 @@
 from measurement_tool import MeasurementTool
 import json
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 class Iperf3(MeasurementTool):
@@ -39,10 +40,14 @@ class Iperf3(MeasurementTool):
     def runTest(self, test_name: str) -> int:
         """Run the iperf3 test with the given name."""
         test_parameters = ['iperf3']
+        logfile = None
 
         for parameter, flag in self.VALUE_FLAGS.items():
             value = self.parameters.get(parameter)
             if value:
+                if parameter == "logfile":
+                    logfile = self._new_logfile_path(value, test_name)
+                    value = logfile
                 test_parameters.extend([flag, str(value)])
 
         for parameter, flag in self.BOOLEAN_FLAGS.items():
@@ -62,7 +67,6 @@ class Iperf3(MeasurementTool):
             return 1
 
         output = result.stdout
-        logfile = self.parameters.get("logfile")
         if logfile:
             output = Path(logfile).read_text()
 
@@ -84,6 +88,17 @@ class Iperf3(MeasurementTool):
             print("iperf3 did not produce valid JSON output")
             return 1
         return 0
+
+    @staticmethod
+    def _new_logfile_path(logfile: str | Path, test_name: str) -> Path:
+        """Create a unique logfile path without changing the configured base name."""
+        path = Path(logfile)
+        safe_test_name = "".join(
+            character if character.isalnum() or character in ("-", "_") else "_"
+            for character in test_name
+        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        return path.with_name(f"{path.stem}_{safe_test_name}_{timestamp}{path.suffix}")
 
     def getTestData(self, test_name: str) -> dict:
         """Get the test data for the given test name."""

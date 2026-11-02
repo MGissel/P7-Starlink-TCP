@@ -11,6 +11,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
+
 try:
     from DB import DB
 except ImportError as error:
@@ -30,44 +31,6 @@ METRICS = [
 ]
 
 
-# --- Sample data (used only when DB can't be imported) -----------------------
-
-SAMPLE_TESTS = [
-    ("d0ddee23-1855-4b63-95e9-5799995e3e70", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "5", "interval": "0.5"}'),
-    ("eea24003-f153-4090-b8bb-88bf19a44ffb", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "5", "interval": "0.5"}'),
-    ("f32d247d-3b8d-4649-8961-ba9b491d598a", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "5", "interval": "0.5"}'),
-    ("6eae8c48-436b-44fb-8f7c-4acff415b555", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "5", "interval": "0.1"}'),
-    ("de7ffac0-58c1-462e-be6b-097fe1350f5d", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "5", "interval": "0.2"}'),
-    ("b1f86817-adc3-4164-bf17-4baf78639446", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "3", "interval": "0.2"}'),
-    ("59d538d6-4d50-4718-81d2-7d244996f606", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "3", "interval": "0.1"}'),
-    ("c4e6e4f8-c83a-41ce-8230-7fa617abe967", "BBR", '{"host": "localhost", "json": "true", "logfile": "output.log", "duration": "3", "interval": "0.5"}'),
-]
-
-# (throughput, rtt_ms, cwnd, retrans) rows, ordered by id
-SAMPLE_RESULTS = {
-    "d0ddee23-1855-4b63-95e9-5799995e3e70": [
-        (28034988999.02825, 35, 1506109, 0), (34695652330.966484, 48, 1571592, 0),
-        (37991807300.82697, 43, 1571592, 0), (35160723277.87576, 33, 1571592, 0),
-        (38006228095.75957, 33, 1571592, 0), (37905868763.1227, 32, 1571592, 0),
-        (37335821820.2281, 32, 1571592, 0), (38444683405.452484, 35, 1571592, 0),
-        (38191652240.89948, 42, 1571592, 0), (38381376639.609, 37, 1571592, 0),
-    ],
-    "eea24003-f153-4090-b8bb-88bf19a44ffb": [
-        (34648832988.71082, 67, 1047728, 0), (36977600103.32497, 41, 1047728, 0),
-        (37585234312.65436, 33, 1047728, 0), (37901751285.90566, 39, 1047728, 0),
-        (36058498634.78027, 38, 1047728, 0), (37622382142.31877, 41, 1047728, 0),
-        (37520222468.9041, 31, 1047728, 0), (38132437538.4066, 31, 1047728, 0),
-        (38027580150.90617, 37, 1047728, 0), (37862075856.047775, 31, 1047728, 0),
-    ],
-    "f32d247d-3b8d-4649-8961-ba9b491d598a": [
-        (29265754143.23437, 34, 1309660, 0), (32933897480.836678, 39, 1309660, 0),
-        (38024484375.77637, 32, 1309660, 0), (37813522325.8434, 33, 1309660, 0),
-        (38236056947.95499, 40, 1309660, 0), (37052096093.06734, 47, 1309660, 0),
-        (37259650972.651344, 36, 1309660, 0), (36928599892.10665, 36, 1309660, 0),
-    ],
-}
-
-
 def fake_results(test_id: str) -> list[tuple]:
     rng = random.Random(test_id)
     cwnd = rng.randint(1_000_000, 1_600_000)
@@ -78,10 +41,7 @@ def fake_results(test_id: str) -> list[tuple]:
 
 def fetch_tests() -> list[dict]:
     """Return every test as {"id": str, "cca": str, "parms": dict}."""
-    if DB is None:
-        rows = SAMPLE_TESTS
-    else:
-        with DB() as database:
+    with DB() as database:
             rows = list(database.query("SELECT id, cca, parms FROM tests"))
 
     tests = []
@@ -95,15 +55,13 @@ def fetch_tests() -> list[dict]:
 def fetch_results(test_id: str) -> dict[str, list[float]]:
     """Return one test's samples as {"throughput": [...], "rtt_ms": [...], ...}."""
     columns = ", ".join(name for name, _, _ in METRICS)
-    if DB is None:
-        rows = SAMPLE_RESULTS.get(test_id) or fake_results(test_id)
-    else:
-        with DB() as database:
-            # If your DB.query doesn't accept parameters, adapt this call to how it does.
-            rows = list(database.query(
-                f"SELECT {columns} FROM {RESULTS_TABLE} WHERE test_id = %s ORDER BY id",
-                (test_id,),
-            ))
+    
+    with DB() as database:
+        # If your DB.query doesn't accept parameters, adapt this call to how it does.
+        rows = list(database.query(
+            f"SELECT {columns} FROM {RESULTS_TABLE} WHERE test_id = %s ORDER BY id",
+            (test_id,),
+        ))
 
     return {
         name: [float(row[i]) if row[i] is not None else math.nan for row in rows]
@@ -249,7 +207,7 @@ def main() -> None:
             for axis, (name, _, scale) in zip(axes, METRICS):
                 values = results[name]
                 times = [(i + 1) * interval for i in range(len(values))]
-                axis.plot(times, [v * scale for v in values], marker=".", label=label)
+                axis.plot(times, [v * scale for v in values], linestyle="none", marker=".", label=label)
 
         for axis, (_, ylabel, _) in zip(axes, METRICS):
             axis.set_ylabel(ylabel)
@@ -324,6 +282,44 @@ def main() -> None:
 
     ttk.Button(controls, text="Reload from database", command=reload).grid(
         row=4, column=0, sticky="ew", pady=(10, 0))
+
+    def on_scroll(event) -> None:
+        if event.inaxes is None or event.xdata is None:
+            return
+        factor = 0.8 if event.button == "up" else 1.25  # up = zoom in, down = zoom out
+        left, right = event.inaxes.get_xlim()
+        center = event.xdata  # zoom around the mouse position
+        event.inaxes.set_xlim(center - (center - left) * factor,
+                            center + (right - center) * factor)
+        canvas.draw_idle()
+
+    canvas.mpl_connect("scroll_event", on_scroll)
+
+    pan_state = {"axis": None, "start_x": None, "start_xlim": None}
+
+    def on_press(event) -> None:
+        if event.button != 1 or event.inaxes is None:  # 1 = left mouse button
+            return
+        pan_state["axis"] = event.inaxes
+        pan_state["start_x"] = event.x  # pixel position, not data position
+        pan_state["start_xlim"] = event.inaxes.get_xlim()
+
+    def on_motion(event) -> None:
+        axis = pan_state["axis"]
+        if axis is None:
+            return
+        left, right = pan_state["start_xlim"]
+        data_per_pixel = (right - left) / axis.bbox.width
+        shift = (event.x - pan_state["start_x"]) * data_per_pixel
+        axis.set_xlim(left - shift, right - shift)
+        canvas.draw_idle()
+
+    def on_release(event) -> None:
+        pan_state["axis"] = None
+
+    canvas.mpl_connect("button_press_event", on_press)
+    canvas.mpl_connect("motion_notify_event", on_motion)
+    canvas.mpl_connect("button_release_event", on_release)
 
     def close() -> None:
         figure.clear()

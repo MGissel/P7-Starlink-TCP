@@ -37,16 +37,21 @@ class Experiment:
             tools[name] = tool
         return tools
 
-    def run_tools(self, test_name: str) -> None:
+    def run_tools(self) -> None:
+        test_name = self.config["global_test_settings"]["name"]
         for name, tool in self.tools.items():
             status = tool.runTest(test_name)
             if status != 0:
                 raise RuntimeError(f"{name} test failed")
-            print(json.dumps(tool.getTestData(test_name), indent=2))
+            #print(json.dumps(tool.getTestData(test_name), indent=2))
 
-    def save_iperf_result(self, test_name: str) -> None:
+    def save_iperf_result(self) -> None:
+        test_name = self.config["global_test_settings"]["name"]
         iperf = self.tools.get("iperf")
         if not isinstance(iperf, Iperf3):
+            return
+        if self.config["global_test_settings"].get("offline", "false").lower() == "true":
+            print("Offline mode enabled. Skipping database save.")
             return
         from DB import DB
 
@@ -90,8 +95,8 @@ def main() -> None:
         network.ensure_process_started(server)
 
         experiment = Experiment()
-        experiment.run_tools("test_2")
-        experiment.save_iperf_result("test_2")
+        experiment.run_tools()
+        experiment.save_iperf_result()
 
 
 if __name__ == "__main__":
