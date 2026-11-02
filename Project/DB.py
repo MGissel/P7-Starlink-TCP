@@ -8,25 +8,27 @@ class DB:
     PORT = 5432
     DBNAME = "postgres"
     USER = "postgres"
+    SCHEMA_NAME = "public"
 
     SCHEMA = [
         """
-        CREATE TABLE IF NOT EXISTS cca (
+        CREATE TABLE IF NOT EXISTS public.cca (
             name        VARCHAR PRIMARY KEY,
             description TEXT
         )
         """,
         """
-        CREATE TABLE IF NOT EXISTS tests (
+        CREATE TABLE IF NOT EXISTS public.tests (
             id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            cca    VARCHAR NOT NULL REFERENCES cca(name),
+            name   VARCHAR NOT NULL,
+            cca    VARCHAR NOT NULL REFERENCES public.cca(name),
             parms  JSONB
         )
         """,
         """
-        CREATE TABLE IF NOT EXISTS results (
+        CREATE TABLE IF NOT EXISTS public.results (
             id          BIGSERIAL PRIMARY KEY,
-            test_id     UUID NOT NULL REFERENCES tests(id) ON DELETE CASCADE,
+            test_id     UUID NOT NULL REFERENCES public.tests(id) ON DELETE CASCADE,
             t           TIMESTAMPTZ NOT NULL,
             throughput  DOUBLE PRECISION,
             rtt_ms      DOUBLE PRECISION,
@@ -34,7 +36,7 @@ class DB:
             retrans     INTEGER
         )
         """,
-        "CREATE INDEX IF NOT EXISTS results_test_t_idx ON results (test_id, t)",
+        "CREATE INDEX IF NOT EXISTS results_test_t_idx ON public.results (test_id, t)",
     ]
 
     def __init__(self):
@@ -45,6 +47,8 @@ class DB:
             dbname=self.DBNAME,
             user=self.USER,
         )
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE SCHEMA IF NOT EXISTS public")
         self.create_tables()
 
     def create_tables(self):
@@ -63,14 +67,14 @@ class DB:
         self.conn.commit()
         return result
 
-    def save_iperf_test(self, test_data, cca, parameters):
+    def save_iperf_test(self, test_name, test_data, cca, parameters):
         """Persist one iperf3 run and all of its interval stream results."""
         if not test_data:
             raise ValueError("Cannot save an empty iperf3 result")
 
         self.query(
             """
-            INSERT INTO cca (name)
+            INSERT INTO public.cca (name)
             VALUES (%s)
             ON CONFLICT (name) DO NOTHING
             """,
@@ -79,11 +83,11 @@ class DB:
 
         test_id = self.query(
             """
-            INSERT INTO tests (cca, parms)
-            VALUES (%s, %s)
+            INSERT INTO public.tests (name, cca, parms)
+            VALUES (%s, %s, %s)
             RETURNING id
             """,
-            (cca, json.dumps(parameters)),
+            (test_name, cca, json.dumps(parameters)),
         )[0][0]
 
         timestamp = test_data.get("start", {}).get("timestamp", {}).get("timesecs")
@@ -96,7 +100,7 @@ class DB:
             for result in interval.get("streams", []):
                 self.query(
                     """
-                    INSERT INTO results (test_id, t, throughput, rtt_ms, cwnd, retrans)
+                    INSERT INTO public.results (test_id, t, throughput, rtt_ms, cwnd, retrans)
                     VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (

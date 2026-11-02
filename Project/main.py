@@ -57,9 +57,9 @@ class Experiment:
             print("Offline mode enabled. Skipping database save.")
             return
         from DB import DB
-
         with DB() as database:
             database.save_iperf_test(
+                self.config["global_test_settings"]["name"],
                 iperf.getTestData(test_name),
                 self.config["global_test_settings"]["cca"],
                 iperf.parameters,
