@@ -113,6 +113,21 @@ class DB:
                     ),
                 )
 
+    def delete_tests_by_name(self, names: list[str]) -> int:
+        """Delete tests and their results by test name."""
+        if not names:
+            return 0
+
+        deleted = 0
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM public.tests WHERE name = ANY(%s) RETURNING id",
+                (names,),
+            )
+            deleted = len(cur.fetchall())
+        self.conn.commit()
+        return deleted
+
     def close(self):
         self.conn.close()
 

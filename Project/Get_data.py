@@ -2,12 +2,13 @@ import json
 import math
 import random
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import matplotlib
 
 matplotlib.use("TkAgg")
 
+import psycopg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -18,7 +19,7 @@ except ImportError as error:
     print(f"Could not import DB: {error!r}, using sample data")
     DB = None
 
-RESULTS_TABLE = "results"  # <-- change this to the real name of your results table
+RESULTS_TABLE = "public.results"
 
 ANY = "(any)"
 
@@ -31,8 +32,8 @@ METRICS = [
 ]
 
 
-def fake_results(test_id: str) -> list[tuple]:
-    rng = random.Random(test_id)
+def fake_results(test_name: str) -> list[tuple]:
+    rng = random.Random(test_name)
     cwnd = rng.randint(1_000_000, 1_600_000)
     return [(rng.uniform(30e9, 38e9), rng.randint(30, 50), cwnd, 0) for _ in range(10)]
 
@@ -40,27 +41,32 @@ def fake_results(test_id: str) -> list[tuple]:
 # --- Data access -------------------------------------------------------------
 
 def fetch_tests() -> list[dict]:
-    """Return every test as {"id": str, "cca": str, "parms": dict}."""
+    """Return every test as {"name": str, "cca": str, "parms": dict}."""
     with DB() as database:
-            rows = list(database.query("SELECT id, cca, parms FROM tests"))
+        rows = list(database.query("SELECT name, cca, parms FROM public.tests"))
 
     tests = []
-    for test_id, cca, parms in rows:
+    for test_name, cca, parms in rows:
         if isinstance(parms, str):  # json stored as text; jsonb usually arrives as a dict already
             parms = json.loads(parms)
-        tests.append({"id": str(test_id), "cca": cca, "parms": parms or {}})
+        tests.append({"name": test_name, "cca": cca, "parms": parms or {}})
     return tests
 
 
-def fetch_results(test_id: str) -> dict[str, list[float]]:
+def fetch_results(test_name: str) -> dict[str, list[float]]:
     """Return one test's samples as {"throughput": [...], "rtt_ms": [...], ...}."""
     columns = ", ".join(name for name, _, _ in METRICS)
     
     with DB() as database:
-        # If your DB.query doesn't accept parameters, adapt this call to how it does.
         rows = list(database.query(
-            f"SELECT {columns} FROM {RESULTS_TABLE} WHERE test_id = %s ORDER BY id",
-            (test_id,),
+            f"""
+            SELECT {columns}
+            FROM {RESULTS_TABLE} AS results
+            JOIN public.tests AS tests ON tests.id = results.test_id
+            WHERE tests.name = %s
+            ORDER BY results.id
+            """,
+            (test_name,),
         ))
 
     return {
@@ -108,12 +114,14 @@ class FilterList(ttk.LabelFrame):
 
 
 class TestList(ttk.LabelFrame):
-    """Scrollable list of test ids with a search box. Ctrl/Shift-click selects several."""
+    """Scrollable test list with Ctrl/Shift and C/S selection shortcuts."""
 
     def __init__(self, parent, on_select):
         super().__init__(parent, text="Tests (Ctrl/Shift-click to compare)", padding=5)
         self.on_select = on_select
-        self.ids: list[str] = []
+        self.names: list[str] = []
+        self._c_held = False
+        self._s_held = False
 
         self.search_var = tk.StringVar()
         ttk.Entry(self, textvariable=self.search_var).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
@@ -133,9 +141,53 @@ class TestList(ttk.LabelFrame):
 
         self.search_var.trace_add("write", lambda *_: self._refresh())
         self.listbox.bind("<<ListboxSelect>>", lambda event: self.on_select(self.get()))
+        self.listbox.bind("<KeyPress-c>", self._set_c_held)
+        self.listbox.bind("<KeyPress-C>", self._set_c_held)
+        self.listbox.bind("<KeyRelease-c>", self._set_c_released)
+        self.listbox.bind("<KeyRelease-C>", self._set_c_released)
+        self.listbox.bind("<KeyPress-s>", self._set_s_held)
+        self.listbox.bind("<KeyPress-S>", self._set_s_held)
+        self.listbox.bind("<KeyRelease-s>", self._set_s_released)
+        self.listbox.bind("<KeyRelease-S>", self._set_s_released)
+        self.listbox.bind("<Button-1>", self._handle_alias_click)
 
-    def set_ids(self, ids) -> None:
-        self.ids = list(ids)
+    def _set_c_held(self, event):
+        self._c_held = True
+        return "break"
+
+    def _set_c_released(self, event):
+        self._c_held = False
+        return "break"
+
+    def _set_s_held(self, event):
+        self._s_held = True
+        return "break"
+
+    def _set_s_released(self, event):
+        self._s_held = False
+        return "break"
+
+    def _handle_alias_click(self, event):
+        if not self._c_held and not self._s_held:
+            return
+
+        index = self.listbox.nearest(event.y)
+        if self._s_held:
+            anchor = self.listbox.index("anchor")
+            self.listbox.selection_clear(0, "end")
+            self.listbox.selection_set(min(anchor, index), max(anchor, index))
+        else:
+            if self.listbox.selection_includes(index):
+                self.listbox.selection_clear(index)
+            else:
+                self.listbox.selection_set(index)
+            self.listbox.activate(index)
+            self.listbox.selection_anchor(index)
+        self.on_select(self.get())
+        return "break"
+
+    def set_names(self, names) -> None:
+        self.names = list(names)
         self._refresh()
 
     def get(self) -> list[str]:
@@ -144,16 +196,16 @@ class TestList(ttk.LabelFrame):
     def _refresh(self) -> None:
         previous = self.get()
         text = self.search_var.get().lower()
-        shown = [test_id for test_id in self.ids if text in test_id.lower()]
+        shown = [test_name for test_name in self.names if text in test_name.lower()]
 
         self.listbox.delete(0, "end")
-        for test_id in shown:
-            self.listbox.insert("end", test_id)
-        self.count_var.set(f"{len(shown)} of {len(self.ids)} tests shown")
+        for test_name in shown:
+            self.listbox.insert("end", test_name)
+        self.count_var.set(f"{len(shown)} of {len(self.names)} tests shown")
 
-        kept = [test_id for test_id in previous if test_id in shown]
-        for test_id in kept:
-            self.listbox.selection_set(shown.index(test_id))
+        kept = [test_name for test_name in previous if test_name in shown]
+        for test_name in kept:
+            self.listbox.selection_set(shown.index(test_name))
         if kept:
             self.listbox.see(shown.index(kept[0]))
         if kept != previous:
@@ -177,55 +229,84 @@ def main() -> None:
     controls.grid(row=0, column=1, sticky="ns")
 
     root.columnconfigure(0, weight=1)
+    root.columnconfigure(2, weight=0)
     root.rowconfigure(0, weight=1)
 
     tests: list[dict] = []
-    tests_by_id: dict[str, dict] = {}
+    tests_by_name: dict[str, dict] = {}
     results_cache: dict[str, dict] = {}
     param_filters: dict[str, FilterList] = {}
     details_var = tk.StringVar()
+    line_plot_var = tk.BooleanVar(value=False)
 
-    def get_results(test_id: str) -> dict:
-        if test_id not in results_cache:
-            results_cache[test_id] = fetch_results(test_id)
-        return results_cache[test_id]
+    def get_results(test_name: str) -> dict:
+        if test_name not in results_cache:
+            results_cache[test_name] = fetch_results(test_name)
+        return results_cache[test_name]
 
-    def plot_tests(test_ids: list[str]) -> None:
+    def plot_tests(test_names: list[str]) -> None:
         for axis in axes:
             axis.clear()
             axis.grid(True, alpha=0.3)
 
-        for test_id in test_ids:
-            test = tests_by_id[test_id]
-            results = get_results(test_id)
+        for test_name in test_names:
+            test = tests_by_name[test_name]
+            results = get_results(test_name)
             try:
                 interval = float(test["parms"].get("interval", 1))
-            except ValueError:
+            except (TypeError, ValueError):
                 interval = 1.0
-            label = f"{test['cca']} {test_id[:8]}"
+            try:
+                omit = max(0.0, float(test["parms"].get("omit", 0)))
+            except (TypeError, ValueError):
+                omit = 0.0
+            samples_to_skip = math.ceil(omit / interval) if interval > 0 else 0
+            label = f"{test['cca']} {test_name}"
 
             for axis, (name, _, scale) in zip(axes, METRICS):
-                values = results[name]
-                times = [(i + 1) * interval for i in range(len(values))]
-                axis.plot(times, [v * scale for v in values], linestyle="none", marker=".", label=label)
+                values = results[name][samples_to_skip:]
+                times = [
+                    (i + 1) * interval
+                    for i in range(samples_to_skip, samples_to_skip + len(values))
+                ]
+                axis.plot(
+                    times,
+                    [v * scale for v in values],
+                    linestyle="-" if line_plot_var.get() else "none",
+                    marker=None if line_plot_var.get() else ".",
+                    label=label,
+                )
+
+        axes[0].relim()
+        axes[0].autoscale_view()
+        try:
+            x_min = float(x_min_var.get()) if x_min_var.get().strip() else None
+            x_max = float(x_max_var.get()) if x_max_var.get().strip() else None
+        except ValueError:
+            x_min = x_max = None
+        current_min, current_max = axes[0].get_xlim()
+        axes[0].set_xlim(
+            current_min if x_min is None else x_min,
+            current_max if x_max is None else x_max,
+        )
 
         for axis, (_, ylabel, _) in zip(axes, METRICS):
             axis.set_ylabel(ylabel)
         axes[-1].set_xlabel("Time (s)")
 
-        if test_ids:
+        if test_names:
             axes[0].legend(fontsize="small")
-            axes[0].set_title(f"{len(test_ids)} test(s) selected")
+            axes[0].set_title(f"{len(test_names)} test(s) selected")
         else:
             axes[0].set_title("No test selected")
 
         # Details panel
-        if len(test_ids) == 1:
-            test = tests_by_id[test_ids[0]]
+        if len(test_names) == 1:
+            test = tests_by_name[test_names[0]]
             parms_text = "\n".join(f"  {key}: {value}" for key, value in sorted(test["parms"].items()))
-            details_var.set(f"id: {test['id']}\ncca: {test['cca']}\nparms:\n{parms_text}")
-        elif test_ids:
-            details_var.set(f"{len(test_ids)} tests selected")
+            details_var.set(f"name: {test['name']}\ncca: {test['cca']}\nparms:\n{parms_text}")
+        elif test_names:
+            details_var.set(f"{len(test_names)} tests selected")
         else:
             details_var.set("No test selected")
 
@@ -242,7 +323,7 @@ def main() -> None:
         return True
 
     def apply_filters() -> None:
-        test_list.set_ids(test["id"] for test in tests if matches(test))
+        test_list.set_names(test["name"] for test in tests if matches(test))
 
     cca_filter = FilterList(controls, "CCA", apply_filters)
     cca_filter.grid(row=0, column=0, sticky="ew")
@@ -250,18 +331,18 @@ def main() -> None:
     params_frame = ttk.LabelFrame(controls, text="Parameters", padding=5)
     params_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
 
-    test_list = TestList(controls, plot_tests)
-    test_list.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+    test_list = TestList(root, plot_tests)
+    test_list.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(0, 10), pady=10)
     controls.rowconfigure(2, weight=1)
 
-    ttk.Label(controls, textvariable=details_var, justify="left", font="TkFixedFont").grid(
-        row=3, column=0, sticky="w", pady=(10, 0))
+    ttk.Label(root, textvariable=details_var, justify="left", font="TkFixedFont").grid(
+        row=2, column=2, sticky="nw", padx=(0, 10), pady=(0, 10))
 
     def reload() -> None:
         nonlocal tests
         tests = fetch_tests()
-        tests_by_id.clear()
-        tests_by_id.update({test["id"]: test for test in tests})
+        tests_by_name.clear()
+        tests_by_name.update({test["name"]: test for test in tests})
         results_cache.clear()
 
         cca_filter.set_values(test["cca"] for test in tests)
@@ -282,6 +363,70 @@ def main() -> None:
 
     ttk.Button(controls, text="Reload from database", command=reload).grid(
         row=4, column=0, sticky="ew", pady=(10, 0))
+
+    def delete_selected() -> None:
+        names = test_list.get()
+        if not names:
+            messagebox.showwarning("No test selected", "Select a test to remove.")
+            return
+
+        names_text = "\n".join(f"- {name}" for name in names)
+        if not messagebox.askyesno(
+            "Remove test",
+            f"Remove the following test(s) and their results?\n\n{names_text}",
+        ):
+            return
+
+        try:
+            with DB() as database:
+                deleted = database.delete_tests_by_name(names)
+        except psycopg.Error as error:
+            messagebox.showerror("Remove test failed", str(error))
+            return
+
+        if deleted == 0:
+            messagebox.showwarning("Test not found", "No matching test was found in the database.")
+        else:
+            reload()
+
+    ttk.Button(controls, text="Remove selected test(s)", command=delete_selected).grid(
+        row=5, column=0, sticky="ew", pady=(10, 0))
+
+    ttk.Checkbutton(
+        controls,
+        text="Use line plots",
+        variable=line_plot_var,
+        command=lambda: plot_tests(test_list.get()),
+    ).grid(row=6, column=0, sticky="w", pady=(10, 0))
+
+    x_axis_frame = ttk.LabelFrame(controls, text="X-axis range (seconds)", padding=5)
+    x_axis_frame.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+    x_min_var = tk.StringVar()
+    x_max_var = tk.StringVar()
+    ttk.Label(x_axis_frame, text="Min:").grid(row=0, column=0, sticky="w")
+    ttk.Entry(x_axis_frame, textvariable=x_min_var, width=10).grid(row=0, column=1, padx=(5, 0))
+    ttk.Label(x_axis_frame, text="Max:").grid(row=1, column=0, sticky="w")
+    ttk.Entry(x_axis_frame, textvariable=x_max_var, width=10).grid(row=1, column=1, padx=(5, 0))
+
+    def apply_x_axis_range() -> None:
+        try:
+            x_min = float(x_min_var.get()) if x_min_var.get().strip() else None
+            x_max = float(x_max_var.get()) if x_max_var.get().strip() else None
+        except ValueError:
+            messagebox.showerror("Invalid X-axis range", "Minimum and maximum must be numbers.")
+            return
+
+        if x_min is not None and x_max is not None and x_min >= x_max:
+            messagebox.showerror(
+                "Invalid X-axis range",
+                "The minimum must be smaller than the maximum.",
+            )
+            return
+
+        plot_tests(test_list.get())
+
+    ttk.Button(x_axis_frame, text="Apply", command=apply_x_axis_range).grid(
+        row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
 
     def on_scroll(event) -> None:
         if event.inaxes is None or event.xdata is None:
