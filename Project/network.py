@@ -18,7 +18,11 @@ class NetworkNamespace:
 
     @staticmethod
     def _sudo(*arguments: str) -> None:
-        subprocess.run(["sudo", *arguments], check=True)
+        subprocess.run(
+            ["sudo", *arguments],
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )
 
     def setup(self) -> None:
         """Create and configure the namespace and its veth pair."""

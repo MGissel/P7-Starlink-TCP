@@ -1,6 +1,7 @@
 import configparser
 import json
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from TQ import TQ
@@ -110,7 +111,18 @@ def main() -> None:
     with network.iperf_server() as server:
         time.sleep(1)
         network.ensure_process_started(server)
+        start_time = datetime.now()
+        try:
+            duration = float(experiment.tools["iperf"].parameters.get("duration", 0))
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("The iperf duration must be a valid number") from error
+        expected_end_time = start_time + timedelta(seconds=duration)
+        print(
+            f"The test started at {start_time:%H:%M:%S} "
+            f"and should end at about {expected_end_time:%H:%M:%S}"
+        )
         experiment.run_tools()
+        print("Iperf has finished, now uploading to database")
         experiment.save_iperf_result()
 
 

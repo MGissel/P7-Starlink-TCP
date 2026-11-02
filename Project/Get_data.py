@@ -277,18 +277,36 @@ def main() -> None:
                     label=label,
                 )
 
-        axes[0].relim()
-        axes[0].autoscale_view()
         try:
             x_min = float(x_min_var.get()) if x_min_var.get().strip() else None
             x_max = float(x_max_var.get()) if x_max_var.get().strip() else None
         except ValueError:
             x_min = x_max = None
+        axes[0].relim()
+        axes[0].autoscale_view()
         current_min, current_max = axes[0].get_xlim()
-        axes[0].set_xlim(
-            current_min if x_min is None else x_min,
-            current_max if x_max is None else x_max,
-        )
+        x_min = current_min if x_min is None else x_min
+        x_max = current_max if x_max is None else x_max
+        axes[0].set_xlim(x_min, x_max)
+
+        for axis in axes:
+            visible_values = []
+            for line in axis.lines:
+                times, values = line.get_data()
+                visible_values.extend(
+                    value
+                    for time, value in zip(times, values)
+                    if x_min <= time <= x_max and math.isfinite(value)
+                )
+            if not visible_values:
+                continue
+            minimum = min(visible_values)
+            maximum = max(visible_values)
+            if minimum == maximum:
+                padding = max(abs(minimum) * 0.05, 1.0)
+            else:
+                padding = (maximum - minimum) * 0.05
+            axis.set_ylim(minimum - padding, maximum + padding)
 
         for axis, (_, ylabel, _) in zip(axes, METRICS):
             axis.set_ylabel(ylabel)
