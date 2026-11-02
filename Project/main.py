@@ -45,12 +45,15 @@ class Experiment:
                 raise RuntimeError(f"{name} test failed")
             #print(json.dumps(tool.getTestData(test_name), indent=2))
 
-    def save_iperf_result(self) -> None:
+    def save_iperf_result(self, force_upload: bool = False) -> None:
         test_name = self.config["global_test_settings"]["name"]
         iperf = self.tools.get("iperf")
         if not isinstance(iperf, Iperf3):
             return
-        if self.config["global_test_settings"].get("offline", "false").lower() == "true":
+        if (
+            self.config["global_test_settings"].get("offline", "false").lower() == "true"
+            and not force_upload
+        ):
             print("Offline mode enabled. Skipping database save.")
             return
         from DB import DB
@@ -59,7 +62,7 @@ class Experiment:
             database.save_iperf_test(
                 iperf.getTestData(test_name),
                 self.config["global_test_settings"]["cca"],
-                self.config.get("iperf_client", {}),
+                iperf.parameters,
             )
 
 
@@ -88,13 +91,25 @@ def setup_network_and_theaterq() -> None:
 
 
 def main() -> None:
+    experiment = Experiment()
+    settings = experiment.config["global_test_settings"]
+    upload = settings.get("upload", settings.get("opload", "false")).lower() == "true"
+
+    if upload:
+        iperf = experiment.tools.get("iperf")
+        if not isinstance(iperf, Iperf3):
+            raise RuntimeError("Upload mode requires the iperf tool")
+        test_name = settings["name"]
+        if iperf.load_local_test(test_name) != 0:
+            raise RuntimeError(f"Could not load local test '{test_name}'")
+        experiment.save_iperf_result(force_upload=True)
+        return
+
     network = setup_network_and_theaterq()
 
     with network.iperf_server() as server:
         time.sleep(1)
         network.ensure_process_started(server)
-
-        experiment = Experiment()
         experiment.run_tools()
         experiment.save_iperf_result()
 

@@ -41,12 +41,25 @@ class Iperf3(MeasurementTool):
         """Run the iperf3 test with the given name."""
         test_parameters = ['iperf3']
         logfile = None
+        parameters_file = None
 
         for parameter, flag in self.VALUE_FLAGS.items():
             value = self.parameters.get(parameter)
             if value:
                 if parameter == "logfile":
                     logfile = self._new_logfile_path(value, test_name)
+                    parameters_file = logfile.with_name(
+                        f"parms_{self._safe_test_name(test_name)}.log"
+                    )
+                    if logfile.exists():
+                        print(f"File name: {logfile} already exists. Give the test a new name.")
+                        return 1
+                    if parameters_file.exists():
+                        print(
+                            f"File name: {parameters_file} already exists. "
+                            "Give the test a new name."
+                        )
+                        return 1
                     value = logfile
                 test_parameters.extend([flag, str(value)])
 
@@ -84,8 +97,35 @@ class Iperf3(MeasurementTool):
             if parsed_output is None:
                 raise json.JSONDecodeError("empty output", output, 0)
             self.test_data[test_name] = parsed_output
+            if parameters_file:
+                parameters_file.write_text(
+                    json.dumps(self.parameters, indent=2) + "\n",
+                    encoding="utf-8",
+                )
         except json.JSONDecodeError:
             print("iperf3 did not produce valid JSON output")
+            return 1
+        return 0
+
+    def load_local_test(self, test_name: str) -> int:
+        """Load a previously saved iperf3 result and its parameters."""
+        logfile = self._new_logfile_path(self.parameters.get("logfile", "output.log"), test_name)
+        parameters_file = logfile.with_name(
+            f"parms_{self._safe_test_name(test_name)}.log"
+        )
+
+        if not logfile.exists():
+            print(f"File name: {logfile} does not exist.")
+            return 1
+        if not parameters_file.exists():
+            print(f"File name: {parameters_file} does not exist.")
+            return 1
+
+        try:
+            self.test_data[test_name] = json.loads(logfile.read_text(encoding="utf-8"))
+            self.parameters = json.loads(parameters_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"Could not load local test '{test_name}': {error}")
             return 1
         return 0
 
@@ -93,12 +133,15 @@ class Iperf3(MeasurementTool):
     def _new_logfile_path(logfile: str | Path, test_name: str) -> Path:
         """Create a unique logfile path without changing the configured base name."""
         path = Path(logfile)
-        safe_test_name = "".join(
+        safe_test_name = Iperf3._safe_test_name(test_name)
+        return path.with_name(f"{path.stem}_{safe_test_name}{path.suffix}")
+
+    @staticmethod
+    def _safe_test_name(test_name: str) -> str:
+        return "".join(
             character if character.isalnum() or character in ("-", "_") else "_"
             for character in test_name
         )
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        return path.with_name(f"{path.stem}_{safe_test_name}_{timestamp}{path.suffix}")
 
     def getTestData(self, test_name: str) -> dict:
         """Get the test data for the given test name."""
