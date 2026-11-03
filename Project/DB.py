@@ -93,25 +93,31 @@ class DB:
         timestamp = test_data.get("start", {}).get("timestamp", {}).get("timesecs")
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).timestamp()
-        test_start = datetime.fromtimestamp(timestamp, timezone.utc)
 
-        for interval in test_data.get("intervals", []):
-            interval_time = test_start + timedelta(seconds=interval.get("end", 0))
-            for result in interval.get("streams", []):
-                self.query(
-                    """
-                    INSERT INTO public.results (test_id, t, throughput, rtt_ms, cwnd, retrans)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        test_id,
-                        interval_time,
-                        result.get("bits_per_second"),
-                        result.get("rtt"),
-                        result.get("snd_cwnd"),
-                        result.get("retransmits"),
-                    ),
-                )
+        test_start = datetime.fromtimestamp(timestamp, timezone.utc)
+    
+        with self.conn.cursor() as cur:
+            with cur.copy(
+                """
+                COPY public.results
+                    (test_id, t, throughput, rtt_ms, cwnd, retrans)
+                FROM STDIN
+                """
+            ) as copy:
+                for interval in test_data.get("intervals", []):
+                    interval_time = test_start + timedelta(seconds=interval.get("end", 0))
+                    for result in interval.get("streams", []):
+                        copy.write_row(
+                            (
+                                test_id,
+                                interval_time,
+                                result.get("bits_per_second"),
+                                result.get("rtt"),
+                                result.get("snd_cwnd"),
+                                result.get("retransmits"),
+                            )
+                        )
+        self.conn.commit()
 
     def delete_tests_by_name(self, names: list[str]) -> int:
         """Delete tests and their results by test name."""
