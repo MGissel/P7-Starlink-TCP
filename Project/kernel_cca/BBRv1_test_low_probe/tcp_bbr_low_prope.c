@@ -277,7 +277,9 @@ static void bbr_init_pacing_rate_from_rtt(struct sock *sk)
 		rtt_us = USEC_PER_MSEC;	 /* use nominal default RTT */
 	}
 	bw = (u64)tcp_snd_cwnd(tp) * BW_UNIT;
+	//printk(KERN_DEBUG "bw before do_div %llu, rtt_us before %u",bw,rtt_us);
 	do_div(bw, rtt_us);
+	//printk(KERN_DEBUG "bw before do_div %llu, rtt_us after %u",bw,rtt_us);
 	WRITE_ONCE(sk->sk_pacing_rate,
 		   bbr_bw_to_pacing_rate(sk, bw, bbr_high_gain));
 }
