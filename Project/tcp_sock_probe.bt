@@ -1,0 +1,103 @@
+#!/usr/bin/env bpftrace
+/*
+ * tcp_sock_probe.bt — sample TCP sender state after every received ACK
+ *
+ * Usage:   sudo bpftrace tcp_sock_probe.bt > probe.log
+ * Filter:  connections whose remote port is 5201 (iperf3).
+ *          20756 = 5201 in network byte order (0x1451 -> 0x5114).
+ *
+ * Units:
+ *   t_ns            nanoseconds since boot
+ *   cwnd/ssthresh   segments
+ *   *_us            microseconds
+ *   *_j             jiffies (check HZ: grep CONFIG_HZ= /boot/config-$(uname -r))
+ *   pacing_Bps      bytes per second
+ *   ca_state        0=Open 1=Disorder 2=CWR 3=Recovery 4=Loss
+ *
+ * Field names can differ between kernel versions. If bpftrace complains,
+ * check:  sudo bpftrace -lv 'struct tcp_sock'
+ */
+
+BEGIN
+{
+	printf("t_ns cwnd ssthresh srtt_us rttvar_us minrtt_us ");
+	printf("inflight packets_out sacked_out lost_out retrans_out ");
+	printf("bytes_acked bytes_retrans total_retrans lost delivered delivered_ce ");
+	printf("snd_wnd rcv_wnd pacing_Bps wmem_queued sndbuf ");
+	printf("ca_state backoff rto_j reordering busy_j rwnd_lim_j sndbuf_lim_j\n");
+}
+
+kretfunc:tcp_rcv_established
+/args->sk->__sk_common.skc_dport == 20756/
+{
+	$sk   = args->sk;
+	$tp   = (struct tcp_sock *)$sk;
+	$icsk = (struct inet_connection_sock *)$sk;
+
+	/* Same formula as the kernel's tcp_packets_in_flight() */
+	$inflight = $tp->packets_out - ($tp->sacked_out + $tp->lost_out) + $tp->retrans_out;
+
+	/* RTT */
+	printf("%llu %u %u %u %u %u ",
+		nsecs,
+		$tp->snd_cwnd,
+		$tp->snd_ssthresh,
+		$tp->srtt_us >> 3,          /* stored x8 */
+		$tp->mdev_us >> 2,          /* stored x4 */
+		$tp->rtt_min.s[0].v);       /* windowed min RTT */
+
+	/* What's in the network right now (packets) */
+	printf("%u %u %u %u %u ",
+		$inflight,
+		$tp->packets_out,
+		$tp->sacked_out,
+		$tp->lost_out,
+		$tp->retrans_out);
+
+	/* Cumulative counters — diff these over time */
+	printf("%llu %llu %u %u %u %u ",
+		$tp->bytes_acked,           /* goodput counter */
+		$tp->bytes_retrans,
+		$tp->total_retrans,
+		$tp->lost,
+		$tp->delivered,
+		$tp->delivered_ce);         /* ECN-marked deliveries */
+
+	/* Windows, pacing, send buffer (bytes) */
+	printf("%u %u %llu %d %d ",
+		$tp->snd_wnd,
+		$tp->rcv_wnd,
+		$sk->sk_pacing_rate,
+		$sk->sk_wmem_queued,
+		$sk->sk_sndbuf);
+
+	/* Congestion state, timers, limitation time */
+	printf("%u %u %u %u %u %u %u\n",
+		$icsk->icsk_ca_state,
+		$icsk->icsk_backoff,
+		$icsk->icsk_rto,
+		$tp->reordering,
+		$tp->chrono_stat[0],        /* busy (sending) */
+		$tp->chrono_stat[1],        /* limited by receiver window */
+		$tp->chrono_stat[2]);       /* limited by send buffer */
+}
+
+/*
+ * CUBIC internals — fires each time CUBIC decides how to grow cwnd.
+ * Needs CUBIC built into the kernel (check: sudo bpftrace -lv 'struct bictcp').
+ * Remove this block if it fails to load.
+ *
+ *   w_max       cwnd at the last loss (segments) — the plateau CUBIC aims for
+ *   K           time until cwnd is back at w_max (units of 1/1024 s)
+ *   epoch_start start of the current growth epoch (jiffies, 0 = no epoch)
+ *   cnt         ACKs needed per +1 cwnd (lower = faster growth)
+ *   delay_min   CUBIC's own minimum RTT (us)
+ */
+kfunc:cubictcp_cong_avoid
+/args->sk->__sk_common.skc_dport == 20756/
+{
+	$ca = (struct bictcp *)((uint64)args->sk + offsetof(struct inet_connection_sock, icsk_ca_priv));
+	printf("CUBIC %llu w_max=%u K=%u epoch_start=%u cnt=%u delay_min=%u\n",
+		nsecs, $ca->last_max_cwnd, $ca->bic_K, $ca->epoch_start,
+		$ca->cnt, $ca->delay_min);
+}
