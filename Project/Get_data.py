@@ -1,8 +1,9 @@
 import json
 import math
-import random
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import messagebox, ttk
+from typing import Callable
 
 import matplotlib
 
@@ -12,67 +13,258 @@ import psycopg
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-
-try:
-    from DB import DB
-except ImportError as error:
-    print(f"Could not import DB: {error!r}, using sample data")
-    DB = None
-
-RESULTS_TABLE = "public.results"
+from DB import DB
 
 ANY = "(any)"
+DEFAULT_BIN_MS = 100   # probe samples are averaged into bins of this size
 
-# (column, axis label, scale factor applied before plotting)
-METRICS = [
-    ("throughput", "Throughput (Gbit/s)", 1e-9),  # assumes throughput is stored in bit/s
-    ("rtt_ms", "RTT (ms)", 1),
-    ("cwnd", "cwnd", 1),
-    ("retrans", "Retransmits", 1),
+# --- Probe columns and how they are aggregated per bin ------------------------
+
+TCP_AVG = [                       # gauges: averaged over the bin
+    "cwnd", "ssthresh", "srtt_us", "rttvar_us", "inflight", "packets_out",
+    "sacked_out", "lost_out", "retrans_out", "snd_wnd", "rcv_wnd", "pacing_bps",
+    "wmem_queued", "sndbuf", "rto_j", "reordering",
 ]
+TCP_MAX = ["ca_state", "backoff"]  # states: worst value in the bin
+TCP_MIN = ["minrtt_us"]            # lowest value in the bin
+TCP_COUNTERS = [                   # cumulative: first/last value in the bin -> deltas
+    "bytes_acked", "bytes_retrans", "total_retrans", "lost", "delivered",
+    "delivered_ce", "busy_j", "rwnd_lim_j", "sndbuf_lim_j",
+]
+CUBIC_COLUMNS = ["w_max", "k", "epoch_start", "cnt", "delay_min"]
+IPERF_COLUMNS = ["throughput", "rtt_ms", "cwnd", "retrans"]
 
 
-def fake_results(test_name: str) -> list[tuple]:
-    rng = random.Random(test_name)
-    cwnd = rng.randint(1_000_000, 1_600_000)
-    return [(rng.uniform(30e9, 38e9), rng.randint(30, 50), cwnd, 0) for _ in range(10)]
+# --- Metric definitions ------------------------------------------------------
+
+@dataclass(frozen=True)
+class Metric:
+    key: str
+    group: str                          # heading in the sidebar
+    label: str                          # sidebar text and y-axis label
+    source: str                         # "tcp", "cubic" or "iperf"
+    values: Callable[[dict], list]      # computes the series from that source's data
+    default: bool = False               # checked when the viewer starts
+
+
+def col(name: str, scale: float = 1.0):
+    """A column as-is, multiplied by scale."""
+    return lambda d: [v * scale for v in d[name]]
+
+
+def ratio(numerators, denominators, scale: float = 100.0) -> list[float]:
+    return [n / d * scale if d else math.nan for n, d in zip(numerators, denominators)]
+
+
+def rate(counter: str, scale: float = 1.0):
+    """Increase of a cumulative counter per second."""
+    return lambda d: [
+        x / dt * scale if dt > 0 else math.nan
+        for x, dt in zip(d[f"d_{counter}"], d["dt"])
+    ]
+
+
+def chrono_share(part: str):
+    """Share of the sender's time spent in one chrono state (busy, rwnd- or sndbuf-limited)."""
+    def compute(d):
+        total = [a + b + c for a, b, c in zip(d["d_busy_j"], d["d_rwnd_lim_j"], d["d_sndbuf_lim_j"])]
+        return ratio(d[f"d_{part}"], total)
+    return compute
+
+
+KB = 1 / 1024
+MBIT_FROM_BYTES = 8e-6
+
+METRICS = [
+    # Derived from several probe values
+    Metric("goodput", "Derived", "Goodput (Mbit/s)", "tcp",
+           rate("bytes_acked", MBIT_FROM_BYTES), default=True),
+    Metric("retrans_overhead", "Derived", "Retransmission overhead (%)", "tcp",
+           lambda d: ratio(d["d_bytes_retrans"],
+                           [a + r for a, r in zip(d["d_bytes_acked"], d["d_bytes_retrans"])]),
+           default=True),
+    Metric("loss_rate", "Derived", "Loss rate (%)", "tcp",
+           lambda d: ratio(d["d_lost"], d["d_delivered"])),
+    Metric("queue_delay", "Derived", "Queueing delay (ms)", "tcp",
+           lambda d: [(s - m) / 1000 for s, m in zip(d["avg_srtt_us"], d["min_minrtt_us"])],
+           default=True),
+    Metric("window_used", "Derived", "Window used (%)", "tcp",
+           lambda d: ratio(d["avg_inflight"], d["avg_cwnd"])),
+    Metric("rwnd_share", "Derived", "Receiver-limited share (%)", "tcp", chrono_share("rwnd_lim_j")),
+    Metric("sndbuf_share", "Derived", "Send-buffer-limited share (%)", "tcp", chrono_share("sndbuf_lim_j")),
+
+    # Probe values, averaged per bin
+    Metric("cwnd", "TCP state", "cwnd (segments)", "tcp", col("avg_cwnd"), default=True),
+    Metric("ssthresh", "TCP state", "ssthresh (segments)", "tcp", col("avg_ssthresh")),
+    Metric("srtt", "TCP state", "Smoothed RTT (ms)", "tcp", col("avg_srtt_us", 1e-3)),
+    Metric("rttvar", "TCP state", "RTT variation (ms)", "tcp", col("avg_rttvar_us", 1e-3)),
+    Metric("minrtt", "TCP state", "Min RTT (ms)", "tcp", col("min_minrtt_us", 1e-3)),
+    Metric("inflight", "TCP state", "In flight (packets)", "tcp", col("avg_inflight")),
+    Metric("packets_out", "TCP state", "Packets out", "tcp", col("avg_packets_out")),
+    Metric("sacked_out", "TCP state", "SACKed out (packets)", "tcp", col("avg_sacked_out")),
+    Metric("lost_out", "TCP state", "Lost out (packets)", "tcp", col("avg_lost_out")),
+    Metric("retrans_out", "TCP state", "Retrans out (packets)", "tcp", col("avg_retrans_out")),
+    Metric("snd_wnd", "TCP state", "Receiver window (KB)", "tcp", col("avg_snd_wnd", KB)),
+    Metric("rcv_wnd", "TCP state", "Own receive window (KB)", "tcp", col("avg_rcv_wnd", KB)),
+    Metric("pacing", "TCP state", "Pacing rate (Mbit/s)", "tcp", col("avg_pacing_bps", MBIT_FROM_BYTES)),
+    Metric("wmem_queued", "TCP state", "Send buffer used (KB)", "tcp", col("avg_wmem_queued", KB)),
+    Metric("sndbuf", "TCP state", "Send buffer size (KB)", "tcp", col("avg_sndbuf", KB)),
+    Metric("ca_state", "TCP state", "CA state (0 Open–4 Loss)", "tcp", col("max_ca_state")),
+    Metric("backoff", "TCP state", "RTO backoff", "tcp", col("max_backoff")),
+    Metric("rto", "TCP state", "RTO (jiffies)", "tcp", col("avg_rto_j")),
+    Metric("reordering", "TCP state", "Reordering (packets)", "tcp", col("avg_reordering")),
+
+    # Cumulative probe counters turned into rates
+    Metric("retrans_rate", "Rates", "Retransmitted (Mbit/s)", "tcp", rate("bytes_retrans", MBIT_FROM_BYTES)),
+    Metric("retrans_segs", "Rates", "Retransmitted segments (/s)", "tcp", rate("total_retrans")),
+    Metric("lost_rate", "Rates", "Lost packets (/s)", "tcp", rate("lost")),
+    Metric("delivered_rate", "Rates", "Delivered packets (/s)", "tcp", rate("delivered")),
+    Metric("ce_rate", "Rates", "ECN CE-marked packets (/s)", "tcp", rate("delivered_ce")),
+
+    # Cumulative probe counters as-is
+    Metric("c_bytes_acked", "Counters (cumulative)", "Bytes ACKed (MB)", "tcp", col("last_bytes_acked", 1e-6)),
+    Metric("c_bytes_retrans", "Counters (cumulative)", "Bytes retransmitted (MB)", "tcp", col("last_bytes_retrans", 1e-6)),
+    Metric("c_total_retrans", "Counters (cumulative)", "Retransmitted segments", "tcp", col("last_total_retrans")),
+    Metric("c_lost", "Counters (cumulative)", "Lost packets", "tcp", col("last_lost")),
+    Metric("c_delivered", "Counters (cumulative)", "Delivered packets", "tcp", col("last_delivered")),
+    Metric("c_delivered_ce", "Counters (cumulative)", "CE-marked packets", "tcp", col("last_delivered_ce")),
+    Metric("c_busy", "Counters (cumulative)", "Busy time (jiffies)", "tcp", col("last_busy_j")),
+    Metric("c_rwnd_lim", "Counters (cumulative)", "Rwnd-limited (jiffies)", "tcp", col("last_rwnd_lim_j")),
+    Metric("c_sndbuf_lim", "Counters (cumulative)", "Sndbuf-limited (jiffies)", "tcp", col("last_sndbuf_lim_j")),
+
+    # CUBIC internals
+    Metric("w_max", "CUBIC", "W_max (segments)", "cubic", col("max_w_max")),
+    Metric("k", "CUBIC", "K (s)", "cubic", col("max_k", 1 / 1024)),
+    Metric("epoch_start", "CUBIC", "Epoch start (jiffies)", "cubic", col("max_epoch_start")),
+    Metric("cnt", "CUBIC", "cnt (ACKs per +1 cwnd)", "cubic", col("max_cnt")),
+    Metric("delay_min", "CUBIC", "CUBIC min delay (ms)", "cubic", col("max_delay_min", 1e-3)),
+
+    # The iperf3 interval results (the old graphs)
+    Metric("iperf_throughput", "iperf3 (per interval)", "iperf throughput (Mbit/s)", "iperf", col("throughput", 1e-6)),
+    Metric("iperf_rtt", "iperf3 (per interval)", "iperf RTT (ms)", "iperf", col("rtt_ms")),
+    Metric("iperf_cwnd", "iperf3 (per interval)", "iperf cwnd (KB)", "iperf", col("cwnd", KB)),
+    Metric("iperf_retrans", "iperf3 (per interval)", "iperf retransmits", "iperf", col("retrans")),
+]
 
 
 # --- Data access -------------------------------------------------------------
 
+def parm_float(test: dict, key: str, default: float) -> float:
+    try:
+        return float(test["parms"].get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def to_columns(rows, names) -> dict[str, list[float]]:
+    """Turn row tuples into {name: [float, ...]}."""
+    return {
+        name: [float(row[i]) if row[i] is not None else math.nan for row in rows]
+        for i, name in enumerate(names)
+    }
+
+
 def fetch_tests() -> list[dict]:
-    """Return every test as {"name": str, "cca": str, "parms": dict}."""
+    """Return every test as {"id", "name", "cca", "parms"}."""
     with DB() as database:
-        rows = list(database.query("SELECT name, cca, parms FROM public.tests"))
+        rows = list(database.query("SELECT id, name, cca, parms FROM public.tests"))
 
     tests = []
-    for test_name, cca, parms in rows:
+    for test_id, test_name, cca, parms in rows:
         if isinstance(parms, str):  # json stored as text; jsonb usually arrives as a dict already
             parms = json.loads(parms)
-        tests.append({"name": test_name, "cca": cca, "parms": parms or {}})
+        tests.append({"id": test_id, "name": test_name, "cca": cca, "parms": parms or {}})
     return tests
 
 
-def fetch_results(test_name: str) -> dict[str, list[float]]:
-    """Return one test's samples as {"throughput": [...], "rtt_ms": [...], ...}."""
-    columns = ", ".join(name for name, _, _ in METRICS)
-    
-    with DB() as database:
-        rows = list(database.query(
-            f"""
-            SELECT {columns}
-            FROM {RESULTS_TABLE} AS results
-            JOIN public.tests AS tests ON tests.id = results.test_id
-            WHERE tests.name = %s
-            ORDER BY results.id
-            """,
-            (test_name,),
-        ))
+def fetch_iperf(database, test: dict) -> dict:
+    rows = database.query(
+        f"SELECT {', '.join(IPERF_COLUMNS)} FROM public.results WHERE test_id = %s ORDER BY id",
+        (test["id"],),
+    ) or []
+    data = to_columns(rows, IPERF_COLUMNS)
+    interval = parm_float(test, "interval", 1.0) or 1.0
+    data["t"] = [(i + 1) * interval for i in range(len(rows))]
+    return data
 
-    return {
-        name: [float(row[i]) if row[i] is not None else math.nan for row in rows]
-        for i, (name, _, _) in enumerate(METRICS)
-    }
+
+def add_bin_times(data: dict, bin_ns: int) -> None:
+    """Bin numbers -> time at the end of each bin (s), and each bin's span since the previous one."""
+    bin_s = bin_ns / 1e9
+    bins = data["bin"]
+    data["t"] = [(b + 1) * bin_s for b in bins]
+    data["dt"] = [bin_s if i == 0 else (b - bins[i - 1]) * bin_s for i, b in enumerate(bins)]
+
+
+def fetch_tcp(database, test_id, t0: int, bin_ns: int) -> dict:
+    names, select = ["bin"], ["(t_ns - %(t0)s) / %(bin)s"]
+    for c in TCP_AVG:
+        names.append(f"avg_{c}"); select.append(f"avg({c})")
+    for c in TCP_MAX:
+        names.append(f"max_{c}"); select.append(f"max({c})")
+    for c in TCP_MIN:
+        names.append(f"min_{c}"); select.append(f"min({c})")
+    for c in TCP_COUNTERS:
+        names += [f"first_{c}", f"last_{c}"]; select += [f"min({c})", f"max({c})"]
+
+    rows = database.query(
+        f"""
+        SELECT {', '.join(select)}
+        FROM public.tcp_samples
+        WHERE test_id = %(id)s
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        {"id": test_id, "t0": t0, "bin": bin_ns},
+    ) or []
+    data = to_columns(rows, names)
+    add_bin_times(data, bin_ns)
+
+    # Increase of each counter since the previous bin (first bin: within itself)
+    for c in TCP_COUNTERS:
+        first, last = data[f"first_{c}"], data[f"last_{c}"]
+        data[f"d_{c}"] = [
+            last[i] - (first[i] if i == 0 else last[i - 1]) for i in range(len(last))
+        ]
+    return data
+
+
+def fetch_cubic(database, test_id, t0: int, bin_ns: int) -> dict:
+    names = ["bin"] + [f"max_{c}" for c in CUBIC_COLUMNS]
+    select = ["(t_ns - %(t0)s) / %(bin)s"] + [f"max({c})" for c in CUBIC_COLUMNS]
+    rows = database.query(
+        f"""
+        SELECT {', '.join(select)}
+        FROM public.cubic_samples
+        WHERE test_id = %(id)s
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        {"id": test_id, "t0": t0, "bin": bin_ns},
+    ) or []
+    data = to_columns(rows, names)
+    add_bin_times(data, bin_ns)
+    return data
+
+
+def fetch_test_data(test: dict, bin_ns: int) -> dict:
+    """All data for one test: {"iperf": {...}, "tcp": {...}, "cubic": {...}}.
+
+    Probe times are seconds since the test's first TCP probe sample.
+    """
+    with DB() as database:
+        data = {"iperf": fetch_iperf(database, test)}
+        t0 = database.query(
+            "SELECT min(t_ns) FROM public.tcp_samples WHERE test_id = %s", (test["id"],)
+        )[0][0]
+        if t0 is None:
+            t0 = database.query(
+                "SELECT min(t_ns) FROM public.cubic_samples WHERE test_id = %s", (test["id"],)
+            )[0][0]
+        if t0 is not None:
+            data["tcp"] = fetch_tcp(database, test["id"], t0, bin_ns)
+            data["cubic"] = fetch_cubic(database, test["id"], t0, bin_ns)
+    return data
 
 
 def sort_key(value: str):
@@ -84,6 +276,63 @@ def sort_key(value: str):
 
 
 # --- Widgets -----------------------------------------------------------------
+
+class MetricSidebar(ttk.Frame):
+    """Scrollable list of checkboxes, one per metric, grouped by Metric.group."""
+
+    def __init__(self, parent, on_change):
+        super().__init__(parent, padding=(10, 10, 0, 10))
+        self.vars: dict[str, tk.BooleanVar] = {}
+        self.on_change = on_change
+
+        buttons = ttk.Frame(self)
+        buttons.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        ttk.Label(buttons, text="Graphs", font="TkHeadingFont").pack(side="left")
+        ttk.Button(buttons, text="None", width=5, command=lambda: self.set_all(False)).pack(side="right")
+        ttk.Button(buttons, text="All", width=5, command=lambda: self.set_all(True)).pack(side="right")
+
+        self.canvas = tk.Canvas(self, width=230, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        inner = ttk.Frame(self.canvas)
+        inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.grid(row=1, column=0, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.rowconfigure(1, weight=1)
+
+        frames: dict[str, ttk.LabelFrame] = {}
+        for metric in METRICS:
+            if metric.group not in frames:
+                frames[metric.group] = ttk.LabelFrame(inner, text=metric.group, padding=4)
+                frames[metric.group].pack(fill="x", pady=(0, 6))
+            var = tk.BooleanVar(value=metric.default)
+            self.vars[metric.key] = var
+            ttk.Checkbutton(frames[metric.group], text=metric.label, variable=var,
+                            command=self.on_change).pack(anchor="w")
+
+        # Mouse wheel scrolls the list while the pointer is over it (Linux and Windows/macOS)
+        self.canvas.bind("<Enter>", lambda e: self._bind_wheel(True))
+        self.canvas.bind("<Leave>", lambda e: self._bind_wheel(False))
+
+    def _bind_wheel(self, active: bool) -> None:
+        if active:
+            self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
+            self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+            self.canvas.bind_all("<MouseWheel>",
+                                 lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+        else:
+            for sequence in ("<Button-4>", "<Button-5>", "<MouseWheel>"):
+                self.canvas.unbind_all(sequence)
+
+    def set_all(self, value: bool) -> None:
+        for var in self.vars.values():
+            var.set(value)
+        self.on_change()
+
+    def selected(self) -> list[Metric]:
+        return [metric for metric in METRICS if self.vars[metric.key].get()]
+
 
 class FilterList(ttk.LabelFrame):
     """A small scrollable list of values with "(any)" at the top."""
@@ -218,77 +467,90 @@ def main() -> None:
     root = tk.Tk()
     root.title("Test viewer")
 
-    # Plots on the left: one subplot per metric, sharing the time axis
+    # Layout: [graph checkboxes] [plots] [filters/controls] [test list]
     figure = Figure(figsize=(8, 8), constrained_layout=True)
-    axes = figure.subplots(len(METRICS), 1, sharex=True)
     canvas = FigureCanvasTkAgg(figure, master=root)
-    canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+    canvas.get_tk_widget().grid(row=0, column=1, rowspan=3, sticky="nsew")
 
-    # Controls on the right
     controls = ttk.Frame(root, padding=10)
-    controls.grid(row=0, column=1, sticky="ns")
+    controls.grid(row=0, column=2, rowspan=3, sticky="ns")
 
-    root.columnconfigure(0, weight=1)
-    root.columnconfigure(2, weight=0)
+    root.columnconfigure(1, weight=1)
     root.rowconfigure(0, weight=1)
 
     tests: list[dict] = []
     tests_by_name: dict[str, dict] = {}
-    results_cache: dict[str, dict] = {}
+    data_cache: dict[tuple[str, int], dict] = {}
     param_filters: dict[str, FilterList] = {}
     details_var = tk.StringVar()
     line_plot_var = tk.BooleanVar(value=False)
+    state = {"bin_ns": DEFAULT_BIN_MS * 1_000_000, "axes": []}
 
-    def get_results(test_name: str) -> dict:
-        if test_name not in results_cache:
-            results_cache[test_name] = fetch_results(test_name)
-        return results_cache[test_name]
+    def get_data(test_name: str) -> dict:
+        key = (test_name, state["bin_ns"])
+        if key not in data_cache:
+            data_cache[key] = fetch_test_data(tests_by_name[test_name], state["bin_ns"])
+        return data_cache[key]
 
     def plot_tests(test_names: list[str]) -> None:
+        selected = sidebar.selected()
+        figure.clear()
+
+        if not selected:
+            state["axes"] = []
+            figure.text(0.5, 0.5, "Tick the graphs you want in the left sidebar",
+                        ha="center", va="center")
+            canvas.draw()
+            return
+
+        axes = list(figure.subplots(len(selected), 1, sharex=True, squeeze=False)[:, 0])
+        state["axes"] = axes
         for axis in axes:
-            axis.clear()
             axis.grid(True, alpha=0.3)
 
+        missing_probe = []
         for test_name in test_names:
             test = tests_by_name[test_name]
-            results = get_results(test_name)
-            try:
-                interval = float(test["parms"].get("interval", 1))
-            except (TypeError, ValueError):
-                interval = 1.0
-            try:
-                omit = max(0.0, float(test["parms"].get("omit", 0)))
-            except (TypeError, ValueError):
-                omit = 0.0
-            samples_to_skip = math.ceil(omit / interval) if interval > 0 else 0
+            data = get_data(test_name)
+            if "tcp" not in data:
+                missing_probe.append(test_name)
+            omit = max(0.0, parm_float(test, "omit", 0.0))
             label = f"{test['cca']} {test_name}"
 
-            for axis, (name, _, scale) in zip(axes, METRICS):
-                values = results[name][samples_to_skip:]
-                times = [
-                    (i + 1) * interval
-                    for i in range(samples_to_skip, samples_to_skip + len(values))
+            for axis, metric in zip(axes, selected):
+                source = data.get(metric.source)
+                if not source or not source["t"]:
+                    continue
+                points = [
+                    (t, v) for t, v in zip(source["t"], metric.values(source)) if t >= omit
                 ]
+                if not points:
+                    continue
+                times, values = zip(*points)
                 axis.plot(
                     times,
-                    [v * scale for v in values],
+                    values,
                     linestyle="-" if line_plot_var.get() else "none",
                     marker=None if line_plot_var.get() else ".",
+                    markersize=3,
                     label=label,
                 )
 
+        # X range: the user's min/max if given, otherwise all plotted data
         try:
             x_min = float(x_min_var.get()) if x_min_var.get().strip() else None
             x_max = float(x_max_var.get()) if x_max_var.get().strip() else None
         except ValueError:
             x_min = x_max = None
-        axes[0].relim()
-        axes[0].autoscale_view()
-        current_min, current_max = axes[0].get_xlim()
-        x_min = current_min if x_min is None else x_min
-        x_max = current_max if x_max is None else x_max
+        all_x = [x for axis in axes for line in axis.lines for x in line.get_xdata()]
+        data_min, data_max = (min(all_x), max(all_x)) if all_x else (0.0, 1.0)
+        if data_min == data_max:
+            data_min, data_max = data_min - 0.5, data_max + 0.5
+        x_min = data_min if x_min is None else x_min
+        x_max = data_max if x_max is None else x_max
         axes[0].set_xlim(x_min, x_max)
 
+        # Y range per graph: fit the values inside the visible x range
         for axis in axes:
             visible_values = []
             for line in axis.lines:
@@ -308,12 +570,14 @@ def main() -> None:
                 padding = (maximum - minimum) * 0.05
             axis.set_ylim(minimum - padding, maximum + padding)
 
-        for axis, (_, ylabel, _) in zip(axes, METRICS):
-            axis.set_ylabel(ylabel)
+        for axis, metric in zip(axes, selected):
+            axis.set_ylabel(metric.label, fontsize="small")
+            axis.tick_params(labelsize="small")
         axes[-1].set_xlabel("Time (s)")
 
         if test_names:
-            axes[0].legend(fontsize="small")
+            if any(axis.lines for axis in axes):
+                axes[0].legend(fontsize="small")
             axes[0].set_title(f"{len(test_names)} test(s) selected")
         else:
             axes[0].set_title("No test selected")
@@ -322,13 +586,20 @@ def main() -> None:
         if len(test_names) == 1:
             test = tests_by_name[test_names[0]]
             parms_text = "\n".join(f"  {key}: {value}" for key, value in sorted(test["parms"].items()))
-            details_var.set(f"name: {test['name']}\ncca: {test['cca']}\nparms:\n{parms_text}")
+            probe_text = "no" if missing_probe else "yes"
+            details_var.set(
+                f"name: {test['name']}\ncca: {test['cca']}\nprobe data: {probe_text}\nparms:\n{parms_text}"
+            )
         elif test_names:
-            details_var.set(f"{len(test_names)} tests selected")
+            note = f"\nno probe data: {', '.join(missing_probe)}" if missing_probe else ""
+            details_var.set(f"{len(test_names)} tests selected{note}")
         else:
             details_var.set("No test selected")
 
         canvas.draw()
+
+    sidebar = MetricSidebar(root, lambda: plot_tests(test_list.get()))
+    sidebar.grid(row=0, column=0, rowspan=3, sticky="ns")
 
     def matches(test: dict) -> bool:
         cca = cca_filter.get()
@@ -350,18 +621,18 @@ def main() -> None:
     params_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
 
     test_list = TestList(root, plot_tests)
-    test_list.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(0, 10), pady=10)
+    test_list.grid(row=0, column=3, rowspan=2, sticky="nsew", padx=(0, 10), pady=10)
     controls.rowconfigure(2, weight=1)
 
     ttk.Label(root, textvariable=details_var, justify="left", font="TkFixedFont").grid(
-        row=2, column=2, sticky="nw", padx=(0, 10), pady=(0, 10))
+        row=2, column=3, sticky="nw", padx=(0, 10), pady=(0, 10))
 
     def reload() -> None:
         nonlocal tests
         tests = fetch_tests()
         tests_by_name.clear()
         tests_by_name.update({test["name"]: test for test in tests})
-        results_cache.clear()
+        data_cache.clear()
 
         cca_filter.set_values(test["cca"] for test in tests)
 
@@ -446,6 +717,25 @@ def main() -> None:
     ttk.Button(x_axis_frame, text="Apply", command=apply_x_axis_range).grid(
         row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
 
+    # Probe samples are averaged into bins; smaller bins = more detail, slower loading
+    bin_frame = ttk.LabelFrame(controls, text="Probe bin size (ms)", padding=5)
+    bin_frame.grid(row=8, column=0, sticky="ew", pady=(10, 0))
+    bin_var = tk.StringVar(value=str(DEFAULT_BIN_MS))
+    ttk.Entry(bin_frame, textvariable=bin_var, width=10).grid(row=0, column=0)
+
+    def apply_bin_size() -> None:
+        try:
+            bin_ms = float(bin_var.get())
+            if bin_ms <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid bin size", "The bin size must be a positive number of milliseconds.")
+            return
+        state["bin_ns"] = max(1, int(bin_ms * 1_000_000))
+        plot_tests(test_list.get())
+
+    ttk.Button(bin_frame, text="Apply", command=apply_bin_size).grid(row=0, column=1, padx=(5, 0))
+
     def on_scroll(event) -> None:
         if event.inaxes is None or event.xdata is None:
             return
@@ -453,7 +743,7 @@ def main() -> None:
         left, right = event.inaxes.get_xlim()
         center = event.xdata  # zoom around the mouse position
         event.inaxes.set_xlim(center - (center - left) * factor,
-                            center + (right - center) * factor)
+                              center + (right - center) * factor)
         canvas.draw_idle()
 
     canvas.mpl_connect("scroll_event", on_scroll)
