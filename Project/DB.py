@@ -23,12 +23,22 @@ PROBE_COLUMNS = {
         ("sndbuf_lim_j", "BIGINT"),
         ("sport", "INTEGER"),   # local port: tells the iperf3 data and control connections apart
         ("ino", "BIGINT"),      # socket inode
+        ("rack_rtt_us", "BIGINT"),  # latest RTT sample, not smoothed
     ],
     "cubic_samples": [
         ("t_ns", "BIGINT NOT NULL"),
         ("w_max", "BIGINT"), ("k", "BIGINT"), ("epoch_start", "BIGINT"),
         ("cnt", "BIGINT"), ("delay_min", "BIGINT"),
         ("sport", "INTEGER"),
+    ],
+    # One row per irtt packet (written by irtt.irtt_to_log)
+    "irtt_samples": [
+        ("t_ns", "BIGINT NOT NULL"),       # client send time, on the probe's clock
+        ("seqno", "INTEGER"),
+        ("lost", "SMALLINT"),              # 0 no, 1 on the way to the server, 2 on the way back, 3 unknown
+        ("rtt_ns", "BIGINT"),
+        ("send_delay_ns", "BIGINT"),       # one-way delay client -> server
+        ("receive_delay_ns", "BIGINT"),    # one-way delay server -> client
     ],
 }
 
@@ -263,24 +273,27 @@ class DB:
         self.query("UPDATE public.tests SET name = %s WHERE id = %s", (test_name, test_id))
 
     def save_probe_samples(self, test_id, tcp_file="tcp.log", cubic_file="cubic.log"):
-        """Upload the bpftrace logs into the test's own partitions.
+        """Upload the bpftrace logs into the test's partitions. Returns (tcp_rows, cubic_rows)."""
+        rows = self.save_samples(test_id, {"tcp_samples": tcp_file, "cubic_samples": cubic_file})
+        return rows["tcp_samples"], rows["cubic_samples"]
 
-        Both files are uploaded at the same time over two connections. Each file's
-        first line is a header with the column names; every other line is one sample.
-        Returns (tcp_rows, cubic_rows).
+    def save_samples(self, test_id, files: dict) -> dict:
+        """Upload log files into the test's partitions, all at the same time.
+
+        files maps a table name (a key of PROBE_COLUMNS) to a log file whose first
+        line is a header with column names. Returns {table: rows uploaded}.
         """
         if self.needs_migration:
             raise RuntimeError("Run `python DB.py` once to convert the probe tables first")
 
-        jobs = [("tcp_samples", tcp_file), ("cubic_samples", cubic_file)]
         with self.conn.cursor() as cur:
-            partitions = [self._create_partition(cur, table, test_id) for table, _ in jobs]
+            partitions = {table: self._create_partition(cur, table, test_id) for table in files}
         self.conn.commit()
 
-        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-            futures = [pool.submit(self._copy_log, partition, path)
-                       for partition, (_, path) in zip(partitions, jobs)]
-            return tuple(future.result() for future in futures)
+        with ThreadPoolExecutor(max_workers=len(files)) as pool:
+            futures = {table: pool.submit(self._copy_log, partitions[table], path)
+                       for table, path in files.items()}
+            return {table: future.result() for table, future in futures.items()}
 
     @classmethod
     def _copy_log(cls, partition, path):

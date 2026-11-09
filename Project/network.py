@@ -107,35 +107,39 @@ class NetworkNamespace:
         )
 
     @contextmanager
-    def iperf_server(self) -> Iterator[subprocess.Popen[str]]:
-        """Run an iperf3 server inside the client namespace."""
-        server = subprocess.Popen(
-            [
-                "sudo",
-                "ip",
-                "netns",
-                "exec",
-                self.namespace,
-                "iperf3",
-                "-s",
-            ],
+    def _namespace_process(self, *command: str) -> Iterator[subprocess.Popen[str]]:
+        """Run a command inside the client namespace for the duration of a with-block."""
+        process = subprocess.Popen(
+            ["sudo", "ip", "netns", "exec", self.namespace, *command],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
         try:
-            yield server
+            yield process
         finally:
-            server.terminate()
+            process.terminate()
             try:
-                server.wait(timeout=2)
+                process.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait()
+                process.kill()
+                process.wait()
+
+    def iperf_server(self):
+        """Run an iperf3 server inside the client namespace."""
+        return self._namespace_process("iperf3", "-s")
+
+    def irtt_server(self):
+        """Run an irtt server inside the client namespace.
+
+        -i 0: allow any send interval (the default refuses intervals below 10 ms)
+        -d 0: no maximum test duration
+        """
+        return self._namespace_process("irtt", "server", "-b", "10.200.0.2", "-i", "0", "-d", "0")
 
     @staticmethod
-    def ensure_process_started(process: subprocess.Popen[str]) -> None:
+    def ensure_process_started(process: subprocess.Popen[str], name: str = "iperf3 server") -> None:
         """Raise an actionable error if a background process exited immediately."""
         if process.poll() is not None:
             error = process.stderr.read().strip() if process.stderr else ""
-            raise RuntimeError(f"iperf3 server failed: {error or 'no error output'}")
+            raise RuntimeError(f"{name} failed: {error or 'no error output'}")

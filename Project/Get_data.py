@@ -23,16 +23,28 @@ DEFAULT_BIN_MS = 100   # probe samples are averaged into bins of this size
 TCP_AVG = [                       # gauges: averaged over the bin
     "cwnd", "ssthresh", "srtt_us", "rttvar_us", "inflight", "packets_out",
     "sacked_out", "lost_out", "retrans_out", "snd_wnd", "rcv_wnd", "pacing_bps",
-    "wmem_queued", "sndbuf", "rto_j", "reordering",
+    "wmem_queued", "sndbuf", "rto_j", "reordering", "rack_rtt_us",
 ]
 TCP_MAX = ["ca_state", "backoff"]  # states: worst value in the bin
-TCP_MIN = ["minrtt_us"]            # lowest value in the bin
+TCP_MIN = ["minrtt_us", "rack_rtt_us"]   # lowest value in the bin
 TCP_COUNTERS = [                   # cumulative: first/last value in the bin -> deltas
     "bytes_acked", "bytes_retrans", "total_retrans", "lost", "delivered",
     "delivered_ce", "busy_j", "rwnd_lim_j", "sndbuf_lim_j",
 ]
 CUBIC_COLUMNS = ["w_max", "k", "epoch_start", "cnt", "delay_min"]
 IPERF_COLUMNS = ["throughput", "rtt_ms", "cwnd", "retrans"]
+IRTT_AGGREGATES = [   # (name, SQL aggregate over the bin)
+    ("avg_rtt", "avg(rtt_ns)"),
+    ("min_rtt", "min(rtt_ns)"),
+    ("max_rtt", "max(rtt_ns)"),
+    ("sd_rtt", "stddev_samp(rtt_ns)"),
+    ("avg_send", "avg(send_delay_ns)"),
+    ("avg_receive", "avg(receive_delay_ns)"),
+    ("packets", "count(*)"),
+    ("lost", "count(*) FILTER (WHERE lost > 0)"),
+    ("lost_out", "count(*) FILTER (WHERE lost = 1)"),
+    ("lost_back", "count(*) FILTER (WHERE lost = 2)"),
+]
 
 
 # --- Metric definitions ------------------------------------------------------
@@ -97,6 +109,8 @@ METRICS = [
     Metric("cwnd", "TCP state", "cwnd (segments)", "tcp", col("avg_cwnd"), default=True),
     Metric("ssthresh", "TCP state", "ssthresh (segments)", "tcp", col("avg_ssthresh")),
     Metric("srtt", "TCP state", "Smoothed RTT (ms)", "tcp", col("avg_srtt_us", 1e-3)),
+    Metric("rack_rtt", "TCP state", "Latest RTT sample (ms)", "tcp", col("avg_rack_rtt_us", 1e-3)),
+    Metric("rack_rtt_min", "TCP state", "Latest RTT sample, min in bin (ms)", "tcp", col("min_rack_rtt_us", 1e-3)),
     Metric("rttvar", "TCP state", "RTT variation (ms)", "tcp", col("avg_rttvar_us", 1e-3)),
     Metric("minrtt", "TCP state", "Min RTT (ms)", "tcp", col("min_minrtt_us", 1e-3)),
     Metric("inflight", "TCP state", "In flight (packets)", "tcp", col("avg_inflight")),
@@ -138,6 +152,17 @@ METRICS = [
     Metric("epoch_start", "CUBIC", "Epoch start (jiffies)", "cubic", col("max_epoch_start")),
     Metric("cnt", "CUBIC", "cnt (ACKs per +1 cwnd)", "cubic", col("max_cnt")),
     Metric("delay_min", "CUBIC", "CUBIC min delay (ms)", "cubic", col("max_delay_min", 1e-3)),
+
+    # irtt: small UDP packets at a fixed interval, through the same link (sanity check for RTT)
+    Metric("irtt_rtt", "irtt", "irtt RTT (ms)", "irtt", col("avg_rtt", 1e-6)),
+    Metric("irtt_rtt_min", "irtt", "irtt min RTT (ms)", "irtt", col("min_rtt", 1e-6)),
+    Metric("irtt_rtt_max", "irtt", "irtt max RTT (ms)", "irtt", col("max_rtt", 1e-6)),
+    Metric("irtt_jitter", "irtt", "irtt RTT std dev (ms)", "irtt", col("sd_rtt", 1e-6)),
+    Metric("irtt_send", "irtt", "irtt one-way delay out (ms)", "irtt", col("avg_send", 1e-6)),
+    Metric("irtt_receive", "irtt", "irtt one-way delay back (ms)", "irtt", col("avg_receive", 1e-6)),
+    Metric("irtt_loss", "irtt", "irtt loss (%)", "irtt", lambda d: ratio(d["lost"], d["packets"])),
+    Metric("irtt_loss_out", "irtt", "irtt loss out (%)", "irtt", lambda d: ratio(d["lost_out"], d["packets"])),
+    Metric("irtt_loss_back", "irtt", "irtt loss back (%)", "irtt", lambda d: ratio(d["lost_back"], d["packets"])),
 
     # The iperf3 interval results (the old graphs)
     Metric("iperf_throughput", "iperf3 (per interval)", "iperf throughput (Mbit/s)", "iperf", col("throughput", 1e-6)),
@@ -247,6 +272,25 @@ def fetch_cubic(database, test_id, t0: int, bin_ns: int, where: str, params: dic
     return data
 
 
+def fetch_irtt(database, test_id, t0: int, bin_ns: int) -> dict:
+    names = ["bin"] + [name for name, _ in IRTT_AGGREGATES]
+    # floor(), not integer division: irtt starts before the probe, so times can be negative
+    select = ["floor((t_ns - %(t0)s)::float8 / %(bin)s)::bigint"] + [agg for _, agg in IRTT_AGGREGATES]
+    rows = database.query(
+        f"""
+        SELECT {', '.join(select)}
+        FROM public.irtt_samples
+        WHERE test_id = %(id)s
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        {"id": test_id, "t0": t0, "bin": bin_ns},
+    ) or []
+    data = to_columns(rows, names)
+    add_bin_times(data, bin_ns)
+    return data
+
+
 def data_connection_filters(database, test_id) -> tuple[str, str, dict]:
     """SQL conditions that keep only the iperf3 data connection.
 
@@ -290,9 +334,14 @@ def fetch_test_data(test: dict, bin_ns: int) -> dict:
                 f"SELECT min(t_ns) FROM public.cubic_samples WHERE test_id = %(id)s AND {cubic_where}",
                 {**params, "id": test["id"]},
             )[0][0]
+        if t0 is None:
+            t0 = database.query(
+                "SELECT min(t_ns) FROM public.irtt_samples WHERE test_id = %s", (test["id"],)
+            )[0][0]
         if t0 is not None:
             data["tcp"] = fetch_tcp(database, test["id"], t0, bin_ns, tcp_where, params)
             data["cubic"] = fetch_cubic(database, test["id"], t0, bin_ns, cubic_where, params)
+            data["irtt"] = fetch_irtt(database, test["id"], t0, bin_ns)
     return data
 
 
@@ -541,7 +590,7 @@ def main() -> None:
         for test_name in test_names:
             test = tests_by_name[test_name]
             data = get_data(test_name)
-            if "tcp" not in data:
+            if not data.get("tcp", {}).get("t"):
                 missing_probe.append(test_name)
             omit = max(0.0, parm_float(test, "omit", 0.0))
             label = f"{test['cca']} {test_name}"
