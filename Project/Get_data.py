@@ -196,7 +196,7 @@ def add_bin_times(data: dict, bin_ns: int) -> None:
     data["dt"] = [bin_s if i == 0 else (b - bins[i - 1]) * bin_s for i, b in enumerate(bins)]
 
 
-def fetch_tcp(database, test_id, t0: int, bin_ns: int) -> dict:
+def fetch_tcp(database, test_id, t0: int, bin_ns: int, where: str, params: dict) -> dict:
     names, select = ["bin"], ["(t_ns - %(t0)s) / %(bin)s"]
     for c in TCP_AVG:
         names.append(f"avg_{c}"); select.append(f"avg({c})")
@@ -211,11 +211,11 @@ def fetch_tcp(database, test_id, t0: int, bin_ns: int) -> dict:
         f"""
         SELECT {', '.join(select)}
         FROM public.tcp_samples
-        WHERE test_id = %(id)s
+        WHERE test_id = %(id)s AND {where}
         GROUP BY 1
         ORDER BY 1
         """,
-        {"id": test_id, "t0": t0, "bin": bin_ns},
+        {**params, "id": test_id, "t0": t0, "bin": bin_ns},
     ) or []
     data = to_columns(rows, names)
     add_bin_times(data, bin_ns)
@@ -229,41 +229,70 @@ def fetch_tcp(database, test_id, t0: int, bin_ns: int) -> dict:
     return data
 
 
-def fetch_cubic(database, test_id, t0: int, bin_ns: int) -> dict:
+def fetch_cubic(database, test_id, t0: int, bin_ns: int, where: str, params: dict) -> dict:
     names = ["bin"] + [f"max_{c}" for c in CUBIC_COLUMNS]
     select = ["(t_ns - %(t0)s) / %(bin)s"] + [f"max({c})" for c in CUBIC_COLUMNS]
     rows = database.query(
         f"""
         SELECT {', '.join(select)}
         FROM public.cubic_samples
-        WHERE test_id = %(id)s
+        WHERE test_id = %(id)s AND {where}
         GROUP BY 1
         ORDER BY 1
         """,
-        {"id": test_id, "t0": t0, "bin": bin_ns},
+        {**params, "id": test_id, "t0": t0, "bin": bin_ns},
     ) or []
     data = to_columns(rows, names)
     add_bin_times(data, bin_ns)
     return data
 
 
+def data_connection_filters(database, test_id) -> tuple[str, str, dict]:
+    """SQL conditions that keep only the iperf3 data connection.
+
+    The probe also sees iperf3's control connection (same server port).
+    Mixing the two breaks the counters, e.g. a hugely negative goodput.
+    - Logs with a sport column: keep the socket that ACKed the most bytes.
+    - Older logs without sport: drop samples whose bytes_acked is below
+      0.1 % of the maximum (the control connection only sends a few KB).
+    Returns (tcp_where, cubic_where, params).
+    """
+    sport, max_acked = database.query(
+        """
+        SELECT (SELECT sport FROM public.tcp_samples
+                WHERE test_id = %(id)s AND sport IS NOT NULL
+                ORDER BY bytes_acked DESC LIMIT 1),
+               max(bytes_acked)
+        FROM public.tcp_samples WHERE test_id = %(id)s
+        """,
+        {"id": test_id},
+    )[0]
+    if sport is not None:
+        # CUBIC logs without a sport column are kept whole
+        return "sport = %(sport)s", "(sport = %(sport)s OR sport IS NULL)", {"sport": sport}
+    return "bytes_acked >= %(min_acked)s", "TRUE", {"min_acked": (max_acked or 0) // 1000}
+
+
 def fetch_test_data(test: dict, bin_ns: int) -> dict:
     """All data for one test: {"iperf": {...}, "tcp": {...}, "cubic": {...}}.
 
-    Probe times are seconds since the test's first TCP probe sample.
+    Probe times are seconds since the data connection's first probe sample.
     """
     with DB() as database:
         data = {"iperf": fetch_iperf(database, test)}
+        tcp_where, cubic_where, params = data_connection_filters(database, test["id"])
         t0 = database.query(
-            "SELECT min(t_ns) FROM public.tcp_samples WHERE test_id = %s", (test["id"],)
+            f"SELECT min(t_ns) FROM public.tcp_samples WHERE test_id = %(id)s AND {tcp_where}",
+            {**params, "id": test["id"]},
         )[0][0]
         if t0 is None:
             t0 = database.query(
-                "SELECT min(t_ns) FROM public.cubic_samples WHERE test_id = %s", (test["id"],)
+                f"SELECT min(t_ns) FROM public.cubic_samples WHERE test_id = %(id)s AND {cubic_where}",
+                {**params, "id": test["id"]},
             )[0][0]
         if t0 is not None:
-            data["tcp"] = fetch_tcp(database, test["id"], t0, bin_ns)
-            data["cubic"] = fetch_cubic(database, test["id"], t0, bin_ns)
+            data["tcp"] = fetch_tcp(database, test["id"], t0, bin_ns, tcp_where, params)
+            data["cubic"] = fetch_cubic(database, test["id"], t0, bin_ns, cubic_where, params)
     return data
 
 

@@ -8,7 +8,9 @@ from TQ import TQ
 from iperf3 import Iperf3
 from network import NetworkNamespace
 from ss import SS
-from tcpSocket import SocketReader 
+from tcpSocket import SocketReader
+
+LIVE_UPLOAD_INTERVAL = 10  # seconds between probe uploads while the test runs
 
 
 class Experiment:
@@ -19,6 +21,8 @@ class Experiment:
     def __init__(self, config_file: str | Path = Path(__file__).with_name("config.ini")):
         self.config = self._load_config(config_file)
         self.tools = self._create_tools()
+        self.settings = self.config["global_test_settings"]
+        self.test_name = self.settings["name"]
 
     @staticmethod
     def _load_config(config_file: str | Path) -> dict[str, dict[str, str]]:
@@ -39,39 +43,74 @@ class Experiment:
             tools[name] = tool
         return tools
 
-    def run_tools(self) -> None:
-        test_name = self.config["global_test_settings"]["name"]
-        for name, tool in self.tools.items():
-            status = tool.runTest(test_name)
-            if status != 0:
-                raise RuntimeError(f"{name} test failed")
-            #print(json.dumps(tool.getTestData(test_name), indent=2))
+    @property
+    def offline(self) -> bool:
+        return self.settings.get("offline", "false").lower() == "true"
 
-    def save_iperf_result(self, force_upload: bool = False) -> None:
-        test_name = self.config["global_test_settings"]["name"]
+    @property
+    def iperf(self) -> Iperf3:
         iperf = self.tools.get("iperf")
         if not isinstance(iperf, Iperf3):
-            return
-        if (
-            self.config["global_test_settings"].get("offline", "false").lower() == "true"
-            and not force_upload
-        ):
-            print("Offline mode enabled. Skipping database save.")
-            return
+            raise RuntimeError("This requires the iperf tool")
+        return iperf
 
-        tcp_log, cubic_log, meta_file = probe_files(test_name)
-        clock_offset_ns = None
-        if meta_file.exists():
-            clock_offset_ns = json.loads(meta_file.read_text())["clock_offset_ns"]
+    def run_tools(self) -> None:
+        for name, tool in self.tools.items():
+            status = tool.runTest(self.test_name)
+            if status != 0:
+                raise RuntimeError(f"{name} test failed")
+
+    # --- Database ------------------------------------------------------------
+
+    def create_db_test(self, clock_offset_ns: int):
+        """Create the test row before the test starts, so samples can be streamed into it."""
+        from DB import DB
+        with DB() as database:
+            return database.create_test(
+                f"{self.test_name} (running)",
+                self.settings["cca"],
+                self.iperf.parameters,
+                clock_offset_ns=clock_offset_ns,
+            )
+
+    def finish_db_test(self, test_id, probe_complete: bool) -> None:
+        """Add the iperf3 results and give the test its final name."""
+        from DB import DB
+        with DB() as database:
+            database.save_iperf_results(test_id, self.iperf.getTestData(self.test_name))
+            name = self.test_name if probe_complete else f"{self.test_name} (incomplete)"
+            database.rename_test(test_id, name)
+
+    def mark_db_test(self, test_id, suffix: str) -> None:
+        from DB import DB
+        try:
+            with DB() as database:
+                database.rename_test(test_id, f"{self.test_name} ({suffix})")
+        except Exception as error:
+            print(f"Could not mark the test as {suffix}: {error!r}")
+
+    def upload_from_files(self) -> None:
+        """Upload mode: send a finished test from its local files.
+
+        If the test was already (partly) uploaded live, that version is replaced.
+        """
+        if self.iperf.load_local_test(self.test_name) != 0:
+            raise RuntimeError(f"Could not load local test '{self.test_name}'")
+
+        tcp_log, cubic_log, meta_file = probe_files(self.test_name)
+        meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
 
         from DB import DB
         with DB() as database:
+            if meta.get("test_id"):
+                if database.delete_tests_by_id([meta["test_id"]]):
+                    print("Replaced the earlier upload of this test")
             test_id = database.save_iperf_test(
-                test_name,
-                iperf.getTestData(test_name),
-                self.config["global_test_settings"]["cca"],
-                iperf.parameters,
-                clock_offset_ns=clock_offset_ns,
+                self.test_name,
+                self.iperf.getTestData(self.test_name),
+                self.settings["cca"],
+                self.iperf.parameters,
+                clock_offset_ns=meta.get("clock_offset_ns"),
             )
             if tcp_log.exists() and cubic_log.exists():
                 tcp_rows, cubic_rows = database.save_probe_samples(test_id, tcp_log, cubic_log)
@@ -79,17 +118,21 @@ class Experiment:
             else:
                 print("No probe logs found for this test, uploaded iperf results only")
 
+        meta["test_id"] = str(test_id)
+        meta_file.write_text(json.dumps(meta))
+
 
 PROBE_DIR = Path(__file__).resolve().parent / "probe_logs"
 
 
 def probe_files(test_name: str) -> tuple[Path, Path, Path]:
-    """Log files for one test: TCP samples, CUBIC samples, clock offset."""
+    """Log files for one test: TCP samples, CUBIC samples, metadata (clock offset, test id)."""
     return (
         PROBE_DIR / f"{test_name}_tcp.log",
         PROBE_DIR / f"{test_name}_cubic.log",
         PROBE_DIR / f"{test_name}_probe.json",
     )
+
 
 def setup_network_and_theaterq():
     project_root = Path(__file__).resolve().parent.parent
@@ -113,17 +156,12 @@ def setup_network_and_theaterq():
 
 def main() -> None:
     experiment = Experiment()
-    settings = experiment.config["global_test_settings"]
+    settings = experiment.settings
     upload = settings.get("upload", settings.get("opload", "false")).lower() == "true"
-    test_name = settings["name"]
+    test_name = experiment.test_name
 
     if upload:
-        iperf = experiment.tools.get("iperf")
-        if not isinstance(iperf, Iperf3):
-            raise RuntimeError("Upload mode requires the iperf tool")
-        if iperf.load_local_test(test_name) != 0:
-            raise RuntimeError(f"Could not load local test '{test_name}'")
-        experiment.save_iperf_result(force_upload=True)
+        experiment.upload_from_files()
         return
 
     network = setup_network_and_theaterq()
@@ -131,17 +169,35 @@ def main() -> None:
     PROBE_DIR.mkdir(exist_ok=True)
     tcp_log, cubic_log, meta_file = probe_files(test_name)
 
+    # Offset converts the probe's t_ns (time since boot) to wall-clock time
+    clock_offset_ns = time.time_ns() - time.monotonic_ns()
+
+    # Online: create the test now, so the probe samples can be uploaded while it runs
+    test_id = None
+    if not experiment.offline:
+        test_id = experiment.create_db_test(clock_offset_ns)
+    meta_file.write_text(json.dumps({
+        "clock_offset_ns": clock_offset_ns,
+        "test_id": str(test_id) if test_id else None,
+    }))
+
+    uploader = None
     with network.iperf_server() as server:
         time.sleep(1)
         network.ensure_process_started(server)
 
-        # Start the probe just before the test; offset converts its t_ns to wall-clock time
-        meta_file.write_text(json.dumps({"clock_offset_ns": time.time_ns() - time.monotonic_ns()}))
         reader = SocketReader(tcp_file=tcp_log, cubic_file=cubic_log)
+        if test_id is not None:
+            from liveUpload import LiveUploader
+            uploader = LiveUploader(
+                test_id,
+                {"tcp_samples": tcp_log, "cubic_samples": cubic_log},
+                interval=LIVE_UPLOAD_INTERVAL,
+            )
         try:
             start_time = datetime.now()
             try:
-                duration = float(experiment.tools["iperf"].parameters.get("duration", 0))
+                duration = float(experiment.iperf.parameters.get("duration", 0))
             except (KeyError, TypeError, ValueError) as error:
                 raise RuntimeError("The iperf duration must be a valid number") from error
             expected_end_time = start_time + timedelta(seconds=duration)
@@ -150,18 +206,33 @@ def main() -> None:
                 f"and should end at about {expected_end_time:%H:%M:%S}"
             )
             experiment.run_tools()
-        finally:
+        except BaseException:
+            # Keep what was uploaded, but mark the test as failed
             reader.stop()
+            if uploader is not None:
+                uploader.stop(attempts=1)
+                experiment.mark_db_test(test_id, "failed")
+            raise
+        reader.stop()   # always before uploader.stop(), so the files are complete
 
-    print("Iperf has finished, now uploading to database")
-    experiment.save_iperf_result()
+    if uploader is None:
+        print("Offline mode enabled. Skipping database save.")
+        return
+
+    print("Iperf has finished, uploading the last probe samples and the iperf results")
+    probe_complete = uploader.stop()
+    rows = uploader.rows()
+    print(f"Uploaded {rows['tcp_samples']} TCP and {rows['cubic_samples']} CUBIC probe samples")
+    try:
+        experiment.finish_db_test(test_id, probe_complete)
+    except Exception as error:
+        print(f"Could not save the iperf results: {error!r}")
+        probe_complete = False
+        experiment.mark_db_test(test_id, "incomplete")
+    if not probe_complete:
+        print("Not everything reached the database. Run again with upload = true "
+              "to upload this test from the local files.")
 
 
 if __name__ == "__main__":
-    import traceback
-    try:
-        main()
-        print("main() returned normally")
-    except BaseException:
-        traceback.print_exc()
-        raise
+    main()

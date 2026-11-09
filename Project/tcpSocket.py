@@ -1,14 +1,15 @@
 import subprocess
 import threading
 
-CUBIC_HDR = "t_ns w_max K epoch_start cnt delay_min\n"
 
 class SocketReader:
+    """Run the bpftrace probe and split its output into a TCP and a CUBIC log file."""
+
     def __init__(self, script="tcp_sock_probe.bt",
                  tcp_file="tcp.log", cubic_file="cubic.log"):
         self._tcp = open(tcp_file, "w")
         self._cubic = open(cubic_file, "w")
-        self._cubic.write(CUBIC_HDR)
+        self._cubic_header_written = False
         self._attached = threading.Event()
 
         self._proc = subprocess.Popen(
@@ -35,10 +36,14 @@ class SocketReader:
                 continue
             if cols[0] == "t_ns":                     # header = probes attached
                 self._tcp.write(line)
+                self._tcp.flush()                     # live upload reads the header right away
                 self._attached.set()
-            elif cols[0] == "CUBIC":                  # CUBIC 123 w_max=26 K=...
-                values = [c.split("=", 1)[1] for c in cols[2:]]
-                self._cubic.write(cols[1] + " " + " ".join(values) + "\n")
+            elif cols[0] == "CUBIC":                  # CUBIC 123 w_max=26 K=... sport=...
+                fields = [c.split("=", 1) for c in cols[2:]]
+                if not self._cubic_header_written:    # header from the field names, so new fields just work
+                    self._cubic.write("t_ns " + " ".join(name for name, _ in fields) + "\n")
+                    self._cubic_header_written = True
+                self._cubic.write(cols[1] + " " + " ".join(value for _, value in fields) + "\n")
             elif cols[0].isdigit():                   # TCP state line
                 self._tcp.write(line)
         self._attached.set()                          # bpftrace exited: stop waiting
