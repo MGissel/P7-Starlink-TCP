@@ -13,6 +13,9 @@
  *   *_j             jiffies (check HZ: grep CONFIG_HZ= /boot/config-$(uname -r))
  *   pacing_Bps      bytes per second
  *   ca_state        0=Open 1=Disorder 2=CWR 3=Recovery 4=Loss
+ *   sport           local port (tells the iperf3 data and control connections apart)
+ *   ino             socket inode (matches `ss -e` and /proc/<pid>/fd)
+ *   rack_rtt_us     latest RTT sample, NOT smoothed (srtt_us is smoothed)
  *
  * Field names can differ between kernel versions. If bpftrace complains,
  * check:  sudo bpftrace -lv 'struct tcp_sock'
@@ -24,7 +27,8 @@ BEGIN
 	printf("inflight packets_out sacked_out lost_out retrans_out ");
 	printf("bytes_acked bytes_retrans total_retrans lost delivered delivered_ce ");
 	printf("snd_wnd rcv_wnd pacing_Bps wmem_queued sndbuf ");
-	printf("ca_state backoff rto_j reordering busy_j rwnd_lim_j sndbuf_lim_j\n");
+	printf("ca_state backoff rto_j reordering busy_j rwnd_lim_j sndbuf_lim_j ");
+	printf("sport ino rack_rtt_us\n");
 }
 
 kretfunc:tcp_rcv_established
@@ -71,8 +75,8 @@ kretfunc:tcp_rcv_established
 		$sk->sk_wmem_queued,
 		$sk->sk_sndbuf);
 
-	/* Congestion state, timers, limitation time */
-	printf("%u %u %u %u %u %u %u\n",
+	/* Congestion state, timers, limitation time (no newline yet: more columns follow) */
+	printf("%u %u %u %u %u %u %u ",
 		$icsk->icsk_ca_state,
 		$icsk->icsk_backoff,
 		$icsk->icsk_rto,
@@ -80,6 +84,12 @@ kretfunc:tcp_rcv_established
 		$tp->chrono_stat[0],        /* busy (sending) */
 		$tp->chrono_stat[1],        /* limited by receiver window */
 		$tp->chrono_stat[2]);       /* limited by send buffer */
+
+	/* Socket identity and the unsmoothed RTT — this printf ends the line */
+	printf("%u %llu %u\n",
+		$sk->__sk_common.skc_num,                /* local port */
+		$sk->sk_socket->file->f_inode->i_ino,    /* socket inode (0 once the socket is closed) */
+		$tp->rack.rtt_us);                       /* latest RTT sample, not smoothed */
 }
 
 /*
@@ -92,12 +102,13 @@ kretfunc:tcp_rcv_established
  *   epoch_start start of the current growth epoch (jiffies, 0 = no epoch)
  *   cnt         ACKs needed per +1 cwnd (lower = faster growth)
  *   delay_min   CUBIC's own minimum RTT (us)
+ *   sport       local port, as in the TCP lines
  */
 kfunc:cubictcp_cong_avoid
 /args->sk->__sk_common.skc_dport == 20756/
 {
 	$ca = (struct bictcp *)((uint64)args->sk + offsetof(struct inet_connection_sock, icsk_ca_priv));
-	printf("CUBIC %llu w_max=%u K=%u epoch_start=%u cnt=%u delay_min=%u\n",
+	printf("CUBIC %llu w_max=%u K=%u epoch_start=%u cnt=%u delay_min=%u sport=%u\n",
 		nsecs, $ca->last_max_cwnd, $ca->bic_K, $ca->epoch_start,
-		$ca->cnt, $ca->delay_min);
+		$ca->cnt, $ca->delay_min, args->sk->__sk_common.skc_num);
 }
