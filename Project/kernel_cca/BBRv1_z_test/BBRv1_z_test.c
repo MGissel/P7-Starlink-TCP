@@ -100,7 +100,8 @@ struct bbr {
 		round_start:1,	     /* start of packet-timed tx->ack round? */
 		idle_restart:1,	     /* restarting after idle? */
 		probe_rtt_round_done:1,  /* a BBR_PROBE_RTT round at 4 pkts? */
-		unused:13,
+		unused:4,
+		window_pointer:9,	/*CUSTOM: Pointer for the sliding window*/	
 		lt_is_sampling:1,    /* taking long-term ("LT") samples now? */
 		lt_rtt_cnt:7,	     /* round trips in long-term interval */
 		lt_use_bw:1;	     /* use lt_bw as our bw estimate? */
@@ -118,6 +119,7 @@ struct bbr {
 	u32	prior_cwnd;	/* prior cwnd upon entering loss recovery */
 	u32	full_bw;	/* recent bw, to estimate if pipe is full */
 
+
 	/* For tracking ACK aggregation: */
 	u64	ack_epoch_mstamp;	/* start of ACK sampling epoch */
 	u16	extra_acked[2];		/* max excess data ACKed in epoch */
@@ -125,6 +127,9 @@ struct bbr {
 		extra_acked_win_rtts:5,	/* age of extra_acked, in round trips */
 		extra_acked_win_idx:1,	/* current index in extra_acked array */
 		unused_c:6;
+
+	/*Custom*/
+	u32 mean_rtt;	
 };
 
 #define CYCLE_LEN	8	/* number of phases in a pacing gain cycle */
@@ -209,8 +214,11 @@ static void bbr_check_probe_rtt_done(struct sock *sk);
 /* Frederik Custom variables */
 
 #define WINDOW_SIZE 400
-#define Z_SCORE_BASE_TRESHHOLD = 10
+#define Z_SCORE_BASE_TRESHHOLD = 10 // Adjust untill it makes sense
 u64 window[400] = {0}; // RTT should not be negative
+
+
+// TODO Make something with timer.
 
 /* Frederik custom variables done*/
 
@@ -1027,6 +1035,9 @@ static void bbr_update_gains(struct sock *sk)
 
 static void bbr_update_model(struct sock *sk, const struct rate_sample *rs)
 {
+
+
+
 	bbr_update_bw(sk, rs);
 	bbr_update_ack_aggregation(sk, rs);
 	bbr_update_cycle_phase(sk, rs);
@@ -1040,6 +1051,10 @@ __bpf_kfunc static void bbr_main(struct sock *sk, u32 ack, int flag, const struc
 {
 	struct bbr *bbr = inet_csk_ca(sk);
 	u32 bw;
+
+		printk(KERN_DEBUG "ICSK_CA_PRIV_SIZE %lu",ICSK_CA_PRIV_SIZE);
+		bbr->window_pointer=(1 + bbr->window_pointer)% WINDOW_SIZE;
+
 
 	bbr_update_model(sk, rs);
 

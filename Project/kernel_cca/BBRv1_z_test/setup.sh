@@ -2,11 +2,11 @@
 
 make
 
-$SIGN tcp_bbr_low_prope.ko # For frederik's pc with secure boot.
+$SIGN BBRv1_z_test.ko # For frederik's pc with secure boot.
 
-sudo insmod tcp_bbr_low_prope.ko
+sudo insmod BBRv1_z_test.ko
 
-sudo sysctl net.ipv4.tcp_congestion_control=bbr_low_probe
+sudo sysctl net.ipv4.tcp_congestion_control=BBRv1_z_test
 
 
 make clean
