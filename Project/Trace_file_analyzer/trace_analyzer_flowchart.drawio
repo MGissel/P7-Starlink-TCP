@@ -1,0 +1,28 @@
+<mxfile host="Electron">
+  <diagram name="Page-1" id="0tTuqJjAHB7VCBTESU_u">
+    <mxGraphModel dx="694" dy="595" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="FpD5rtJNIKI1tRPu6Yc0-4" edge="1" parent="1" source="FpD5rtJNIKI1tRPu6Yc0-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="FpD5rtJNIKI1tRPu6Yc0-3" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="FpD5rtJNIKI1tRPu6Yc0-1" parent="1" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;shapeInside=1;fixedSize=1;" value="Tracefile" vertex="1">
+          <mxGeometry height="60" width="120" x="130" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="FpD5rtJNIKI1tRPu6Yc0-2" parent="1" style="shape=parallelogram;perimeter=parallelogramPerimeter;whiteSpace=wrap;html=1;shapeInside=1;fixedSize=1;" value="Sliding_window_size&lt;div&gt;&lt;br&gt;&lt;/div&gt;" vertex="1">
+          <mxGeometry height="60" width="140" x="280" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="FpD5rtJNIKI1tRPu6Yc0-6" edge="1" parent="1" source="FpD5rtJNIKI1tRPu6Yc0-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;defaultLabelBackgroundColor=page;" target="FpD5rtJNIKI1tRPu6Yc0-5" value="">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="FpD5rtJNIKI1tRPu6Yc0-3" parent="1" style="whiteSpace=wrap;html=1;" value="Extract information" vertex="1">
+          <mxGeometry height="60" width="120" x="130" y="200" as="geometry" />
+        </mxCell>
+        <mxCell id="FpD5rtJNIKI1tRPu6Yc0-5" parent="1" style="rounded=0;whiteSpace=wrap;html=1;" value="Fancy plot in format&lt;br&gt;Seconds/Packetloss" vertex="1">
+          <mxGeometry height="60" width="120" x="130" y="340" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
