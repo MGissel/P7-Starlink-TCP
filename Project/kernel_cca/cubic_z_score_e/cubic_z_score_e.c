@@ -63,7 +63,7 @@ static u64 cube_factor __read_mostly;
 
 #define WINDOW_SIZE (400)
 #define Z_SCORE_THRESHOLD (17)
-s64 window[400] = {0};
+#define CLAMP(x, high) (((x) > (high)) ? (high) : (x))
 
 
 /* Note parameters that are used for precomputing scale factors are read-only */
@@ -107,7 +107,7 @@ struct bictcp {
 	u32	end_seq;	/* end_seq of the round */
 	u32	last_ack;	/* last time when the ACK spacing is close */
 	u32	curr_rtt;	/* the minimum rtt of current round */
-	s32 curr_z;
+	u32 curr_z;
 	u32 counter;
 	u32 bic_target;
 	u32 thresh_range;
@@ -115,6 +115,9 @@ struct bictcp {
 	s32 difference;
 	u32 ssthresh;
 	u32 loss_event_timer;
+	u32 loss_event_cwnd;
+	u64 moving_mean;
+
 };
 
 static inline void bictcp_reset(struct bictcp *ca)
@@ -341,17 +344,16 @@ __bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
 	
-	window[ca->counter % WINDOW_SIZE] = tp->srtt_us;
-	ca->counter +=1;
-	ca->loss_event_timer +=1;
+	
+	ca->counter = CLAMP(ca->counter+1, WINDOW_SIZE);
+	ca->loss_event_timer = CLAMP(ca->loss_event_timer + 1, WINDOW_SIZE+1);
+	ca->thresh_counter = CLAMP(ca->thresh_counter + 1, WINDOW_SIZE+1);
+	//tp->rack.rtt_us
+	//tp->srtt_us
+	ca->moving_mean = (tp->rack.rtt_us + CLAMP(ca->counter-1, WINDOW_SIZE-1)*ca->moving_mean) / ca->counter;
 
-	s64 sum = 0;
-	for (int j = 0; j < WINDOW_SIZE; j++){
-		sum += (window[j]);
-	}
-
-	ca->curr_z = (10*WINDOW_SIZE*(s64)tp->srtt_us)/sum;
-	ca->thresh_counter += 1;
+	ca->curr_z = (10*(u64)tp->rack.rtt_us)/ca->moving_mean;
+	
 
 	if (ca->curr_z >= Z_SCORE_THRESHOLD){
 		ca->thresh_counter = 0;
@@ -365,9 +367,9 @@ __bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		tp->snd_cwnd = tp->prior_cwnd;
 	}
 
-
-	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%d, Bictarget,%u, thresh_range,%u, thresh_c,%u, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, diff_bool,%u, prior_cwnd,%u, ssthresh,%u, reset_old,%d", 
-		tp->srtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), ca->curr_z, ca->bic_target, ca->thresh_range, ca->thresh_counter, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, ca->difference, tp->prior_cwnd, ca->ssthresh, ca->curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE);
+	
+	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%u, Bictarget,%u, thresh_range,%u, thresh_c,%u, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, diff_bool,%u, prior_cwnd,%u, ssthresh,%u, reset_old,%d, SRTT,%u", 
+		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), ca->curr_z, ca->bic_target, ca->thresh_range, ca->thresh_counter, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, ca->difference, tp->prior_cwnd, ca->ssthresh, ca->curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE, tp->srtt_us);
 
 	if (!tcp_is_cwnd_limited(sk))
 		return;
@@ -387,12 +389,13 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
-
+	ca->loss_event_cwnd = tcp_snd_cwnd(tp);
 	if (ca->thresh_range){
 		return tp->prior_cwnd;
 	}
 
 	else {
+		
 		ca->loss_event_timer = 0;
 		//ca->epoch_start_max = ca->epoch_start;
 		ca->epoch_start = 0;	/* end of epoch */ //Tells update to recalc a new bic_target
