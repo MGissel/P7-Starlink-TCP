@@ -11,6 +11,7 @@ from irtt import Irtt, irtt_to_log
 from network import NetworkNamespace
 from ss import SS
 from tcpSocket import SocketReader
+from kernelLog import KernelLog
 
 LIVE_UPLOAD_INTERVAL = 10  # seconds between probe uploads while the test runs
 
@@ -251,8 +252,11 @@ def main() -> None:
             network.ensure_process_started(irtt_server, "irtt server")
 
         reader = None
+        kernel_log = None
         try:
             reader = SocketReader(tcp_file=tcp_log, cubic_file=cubic_log)
+            if settings.get("kernel_log", "false").lower() == "true":
+                kernel_log = KernelLog(log_file=PROBE_DIR / f"{test_name}_kernel.log")
             if test_id is not None:
                 from liveUpload import LiveUploader
                 uploader = LiveUploader(
@@ -271,12 +275,16 @@ def main() -> None:
             # Keep what was uploaded, but mark the test as failed
             if reader is not None:
                 reader.stop()
+            if kernel_log is not None:
+                kernel_log.stop()
             if uploader is not None:
                 uploader.stop(attempts=1)
             if test_id is not None:
                 experiment.mark_db_test(test_id, "failed")
             raise
         reader.stop()   # always before uploader.stop(), so the files are complete
+        if kernel_log is not None:
+            kernel_log.stop()
 
     irtt_log = None
     if experiment.irtt:
