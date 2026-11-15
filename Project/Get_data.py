@@ -1,11 +1,15 @@
+import csv
 import json
 import math
 import tkinter as tk
+from collections import Counter
 from dataclasses import dataclass
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("TkAgg")
 
@@ -384,6 +388,439 @@ def fetch_source(test: dict, context: dict, source: str, bin_ns: int) -> dict | 
     return None
 
 
+METRIC_BY_KEY = {metric.key: metric for metric in METRICS}
+
+
+# --- CCA comparison ----------------------------------------------------------
+
+COMPARE_DEFAULT_BIN_MS = 1000    # one goodput/RTT sample per second for the statistics
+COMPARE_DEFAULT_SPAN_S = 120     # length of the time-series window if no range is given
+PAPER_WIDTH_IN = 3.5             # one IEEE column
+PAPER_RC = {                     # font sizes for the saved figures
+    "font.size": 8, "axes.labelsize": 8, "legend.fontsize": 7,
+    "xtick.labelsize": 7, "ytick.labelsize": 7,
+}
+LINE_STYLES = ["-", "--", "-.", ":"]
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
+
+
+@dataclass
+class RunSummary:
+    """One test reduced to equally spaced samples, ready to compare with other tests."""
+    label: str
+    source: str               # "probe" or "iperf" (iperf: sender side, no retransmission overhead)
+    t: list[float]
+    goodput: list[float]      # Mbit/s
+    rtt: list[float]          # ms
+    cwnd: list[float]         # segments (probe) or KB (iperf)
+    retrans: list[float]      # retransmission overhead per sample (%), NaN if unknown
+    total_retrans_pct: float  # retransmitted bytes / all sent bytes over the whole test (%)
+
+
+def finite(values) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    return array[np.isfinite(array)]
+
+
+def percentile(values, q: float) -> float:
+    array = finite(values)
+    return float(np.percentile(array, q)) if array.size else math.nan
+
+
+def run_labels(tests: list[dict]) -> list[str]:
+    """The CCA name, plus the test name when the same CCA is selected more than once."""
+    counts = Counter(test["cca"] for test in tests)
+    return [test["cca"] if counts[test["cca"]] == 1 else f"{test['cca']} ({test['name']})"
+            for test in tests]
+
+
+def summarize_run(label: str, test: dict, tcp: dict | None, iperf: dict | None) -> RunSummary | None:
+    """Prefer the probe data (receiver-acknowledged bytes); fall back to iperf3 intervals."""
+    omit = max(0.0, parm_float(test, "omit", 0.0))
+    if tcp and tcp["t"]:
+        source, t = "probe", tcp["t"]
+        goodput = METRIC_BY_KEY["goodput"].values(tcp)
+        rtt = METRIC_BY_KEY["srtt"].values(tcp)
+        cwnd = tcp["avg_cwnd"]
+        retrans = METRIC_BY_KEY["retrans_overhead"].values(tcp)
+    elif iperf and iperf["t"]:
+        source, t = "iperf", iperf["t"]
+        goodput = [v * 1e-6 for v in iperf["throughput"]]
+        rtt = iperf["rtt_ms"]
+        cwnd = [v * KB for v in iperf["cwnd"]]
+        retrans = [math.nan] * len(t)
+    else:
+        return None
+
+    keep = [i for i, time in enumerate(t) if time >= omit]
+    if not keep:
+        return None
+
+    def pick(seq):
+        return [seq[i] for i in keep]
+
+    total_pct = math.nan
+    if source == "probe":
+        acked = sum(v for v in pick(tcp["d_bytes_acked"]) if math.isfinite(v))
+        resent = sum(v for v in pick(tcp["d_bytes_retrans"]) if math.isfinite(v))
+        total_pct = resent / (acked + resent) * 100 if acked + resent else math.nan
+
+    return RunSummary(label, source, pick(t), pick(goodput), pick(rtt), pick(cwnd),
+                      pick(retrans), total_pct)
+
+
+def run_styles(runs: list[RunSummary]) -> dict[str, dict]:
+    """The same colour, line style and marker for a CCA in every figure (readable in greyscale too)."""
+    colors = matplotlib.colormaps["tab10"].colors
+    return {
+        run.label: {"color": colors[i % len(colors)],
+                    "linestyle": LINE_STYLES[i % len(LINE_STYLES)],
+                    "marker": MARKERS[i % len(MARKERS)]}
+        for i, run in enumerate(runs)
+    }
+
+
+def fit_y_to_visible(axis, x_min: float, x_max: float) -> None:
+    values = []
+    for line in axis.lines:
+        xs, ys = line.get_data()
+        values.extend(y for x, y in zip(xs, ys) if x_min <= x <= x_max and math.isfinite(y))
+    if values:
+        low, high = min(values), max(values)
+        pad = (high - low) * 0.05 if high > low else max(abs(low) * 0.05, 1.0)
+        axis.set_ylim(0.0 if low >= 0 else low - pad, high + pad)
+
+
+def draw_timeseries(fig, runs, styles, options) -> None:
+    """Goodput and cwnd over time, with dashed lines at the handovers."""
+    ax_goodput, ax_cwnd = fig.subplots(2, 1, sharex=True)
+    x_min, x_max = options["x_range"]
+    for run in runs:
+        style = styles[run.label]
+        points = [(t, g, c) for t, g, c in zip(run.t, run.goodput, run.cwnd) if x_min <= t <= x_max]
+        if not points:
+            continue
+        t, goodput, cwnd = zip(*points)
+        line = {"color": style["color"], "linestyle": style["linestyle"], "linewidth": 1}
+        ax_goodput.plot(t, goodput, label=run.label, **line)
+        ax_cwnd.plot(t, cwnd, **line)
+
+    period, offset = options["handover"]
+    if period:
+        first = offset + math.ceil((x_min - offset) / period) * period
+        for x in np.arange(first, x_max, period):
+            for axis in (ax_goodput, ax_cwnd):
+                axis.axvline(x, color="grey", linestyle=":", linewidth=0.8, zorder=0)
+
+    sources = {run.source for run in runs}
+    cwnd_unit = {frozenset({"probe"}): "segments", frozenset({"iperf"}): "KB"}.get(
+        frozenset(sources), "segments / KB")
+    ax_goodput.set_ylabel("Goodput (Mbit/s)")
+    ax_cwnd.set_ylabel(f"cwnd ({cwnd_unit})")
+    ax_cwnd.set_xlabel("Time (s)")
+    ax_goodput.set_xlim(x_min, x_max)
+    for axis in (ax_goodput, ax_cwnd):
+        axis.grid(True, alpha=0.3)
+        fit_y_to_visible(axis, x_min, x_max)
+    if ax_goodput.lines:   # above the plot, so it never hides the dips
+        ax_goodput.legend(loc="lower left", bbox_to_anchor=(0, 1.02, 1, 0.2), mode="expand",
+                          ncol=min(len(ax_goodput.lines), 3), frameon=False, borderaxespad=0)
+
+
+def draw_cdf(fig, runs, styles, options) -> None:
+    """Distribution of goodput over the whole test: further right is better."""
+    axis = fig.subplots()
+    for run in runs:
+        values = np.sort(finite(run.goodput))
+        if not values.size:
+            continue
+        style = styles[run.label]
+        axis.step(values, np.arange(1, values.size + 1) / values.size, where="post",
+                  label=run.label, color=style["color"], linestyle=style["linestyle"], linewidth=1)
+    axis.set_xlabel("Goodput (Mbit/s)")
+    axis.set_ylabel("CDF")
+    axis.set_ylim(0, 1.0)
+    axis.grid(True, alpha=0.3)
+    if axis.lines:
+        axis.legend(loc="upper left")
+
+
+def draw_tradeoff(fig, runs, styles, options) -> None:
+    """Median goodput against median RTT, bars from the 10th to the 90th percentile: up-left is better."""
+    axis = fig.subplots()
+    for run in runs:
+        x, y = percentile(run.rtt, 50), percentile(run.goodput, 50)
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        xerr = [[x - percentile(run.rtt, 10)], [percentile(run.rtt, 90) - x]]
+        yerr = [[y - percentile(run.goodput, 10)], [percentile(run.goodput, 90) - y]]
+        style = styles[run.label]
+        axis.errorbar(x, y, xerr=xerr, yerr=yerr, fmt=style["marker"], color=style["color"],
+                      capsize=3, markersize=5, elinewidth=0.8, label=run.label)
+    axis.set_xlabel("Median RTT (ms)")
+    axis.set_ylabel("Median goodput (Mbit/s)")
+    axis.grid(True, alpha=0.3)
+    if runs:
+        axis.legend(loc="best")
+
+
+def draw_retrans(fig, runs, styles, options) -> None:
+    """Retransmission overhead per sample as box plots (probe data only)."""
+    axis = fig.subplots()
+    kept = [(run, finite(run.retrans)) for run in runs]
+    kept = [(run, values) for run, values in kept if values.size]
+    if not kept:
+        axis.text(0.5, 0.5, "No retransmission data\n(needs probe data)",
+                  ha="center", va="center", transform=axis.transAxes)
+        axis.set_axis_off()
+        return
+    boxes = axis.boxplot([values for _, values in kept], showfliers=False, patch_artist=True,
+                         medianprops={"color": "black"})
+    for box, (run, _) in zip(boxes["boxes"], kept):
+        box.set_facecolor(styles[run.label]["color"])
+        box.set_alpha(0.6)
+    labels = [run.label for run, _ in kept]
+    axis.set_xticks(range(1, len(kept) + 1), labels,
+                    rotation=20 if max(len(label) for label in labels) > 8 else 0,
+                    ha="right" if max(len(label) for label in labels) > 8 else "center")
+    axis.set_ylabel("Retransmission overhead (%)")
+    axis.grid(True, axis="y", alpha=0.3)
+
+
+# (file name, tab title, draw function, height of the saved figure in inches)
+COMPARE_PLOTS = [
+    ("goodput_timeseries", "Goodput over time", draw_timeseries, 3.4),
+    ("goodput_cdf", "Goodput CDF", draw_cdf, 2.4),
+    ("goodput_vs_rtt", "Goodput vs RTT", draw_tradeoff, 2.4),
+    ("retrans_overhead", "Retransmissions", draw_retrans, 2.4),
+]
+
+SUMMARY_COLUMNS = [
+    "CCA", "Data",
+    "Goodput median (Mbit/s)", "Goodput p10 (Mbit/s)", "Goodput p90 (Mbit/s)",
+    "RTT median (ms)", "RTT p10 (ms)", "RTT p90 (ms)",
+    "Retrans. overhead (%)", "Samples",
+]
+
+
+def summary_rows(runs: list[RunSummary]) -> list[list]:
+    rows = []
+    for run in runs:
+        rows.append([
+            run.label, run.source,
+            percentile(run.goodput, 50), percentile(run.goodput, 10), percentile(run.goodput, 90),
+            percentile(run.rtt, 50), percentile(run.rtt, 10), percentile(run.rtt, 90),
+            run.total_retrans_pct, len(finite(run.goodput)),
+        ])
+    return rows
+
+
+def format_cell(value, digits: int = 2) -> str:
+    if isinstance(value, float):
+        return "--" if not math.isfinite(value) else f"{value:.{digits}f}"
+    return str(value)
+
+
+def latex_escape(text: str) -> str:
+    for char, escaped in (("\\", r"\textbackslash{}"), ("_", r"\_"), ("%", r"\%"),
+                          ("&", r"\&"), ("#", r"\#"), ("$", r"\$")):
+        text = text.replace(char, escaped)
+    return text
+
+
+def summary_latex(runs: list[RunSummary], bin_ms: float) -> str:
+    """A booktabs table: median with the 10th-90th percentile for goodput and RTT."""
+    lines = [
+        r"% Needs \usepackage{booktabs}",
+        r"\begin{table}[t]",
+        r"\centering",
+        rf"\caption{{Comparison of CCAs. Medians with 10th and 90th percentile, "
+        rf"over {bin_ms:g}\,ms samples.}}",
+        r"\label{tab:cca-comparison}",
+        r"\begin{tabular}{lrrrrrrr}",
+        r"\toprule",
+        r" & \multicolumn{3}{c}{Goodput (Mbit/s)} & \multicolumn{3}{c}{RTT (ms)} & Retrans. \\",
+        r"\cmidrule(lr){2-4}\cmidrule(lr){5-7}",
+        r"CCA & Median & P10 & P90 & Median & P10 & P90 & (\%) \\",
+        r"\midrule",
+    ]
+    for row in summary_rows(runs):
+        label = latex_escape(row[0]) + (r"$^\dagger$" if row[1] == "iperf" else "")
+        cells = [format_cell(v, 1) for v in row[2:8]] + [format_cell(row[8], 2)]
+        lines.append(" & ".join([label] + cells) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    if any(run.source == "iperf" for run in runs):
+        lines.append(r"\\[2pt]{\footnotesize $^\dagger$ iperf3 sender-side data, no probe data.}")
+    lines.append(r"\end{table}")
+    return "\n".join(lines) + "\n"
+
+
+class CompareWindow(tk.Toplevel):
+    """Comparison plots for the selected tests, with saving for the paper."""
+
+    def __init__(self, master, test_names: list[str],
+                 load_runs: Callable[[int], tuple[list[RunSummary], list[str]]],
+                 x_range: tuple[float | None, float | None]):
+        super().__init__(master)
+        self.title(f"Compare {len(test_names)} test(s)")
+        self.geometry("950x720")
+        self.load_runs = load_runs
+        self.runs: list[RunSummary] = []
+        self.bin_ms = float(COMPARE_DEFAULT_BIN_MS)
+
+        bar = ttk.Frame(self, padding=8)
+        bar.pack(fill="x")
+        self.bin_var = tk.StringVar(value=str(COMPARE_DEFAULT_BIN_MS))
+        self.x_min_var = tk.StringVar(value="" if x_range[0] is None else f"{x_range[0]:g}")
+        self.x_max_var = tk.StringVar(value="" if x_range[1] is None else f"{x_range[1]:g}")
+        self.period_var = tk.StringVar(value="15")
+        self.offset_var = tk.StringVar(value="0")
+        self.prefix_var = tk.StringVar(value="compare")
+        fields = [
+            ("Sample interval (ms)", self.bin_var),
+            ("Time from (s)", self.x_min_var),
+            ("to (s)", self.x_max_var),
+            ("Handover every (s)", self.period_var),
+            ("offset (s)", self.offset_var),
+            ("File prefix", self.prefix_var),
+        ]
+        for column, (text, var) in enumerate(fields):
+            ttk.Label(bar, text=text).grid(row=0, column=column, sticky="w", padx=(0, 6))
+            ttk.Entry(bar, textvariable=var, width=10).grid(row=1, column=column, sticky="w", padx=(0, 6))
+        ttk.Button(bar, text="Update", command=self.update_plots).grid(row=1, column=len(fields), padx=(6, 0))
+        ttk.Button(bar, text="Save…", command=self.save).grid(row=1, column=len(fields) + 1, padx=(6, 0))
+
+        self.status_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.status_var, padding=(8, 0)).pack(fill="x")
+
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        self.canvases = []
+        for _, title, _, _ in COMPARE_PLOTS:
+            frame = ttk.Frame(notebook)
+            notebook.add(frame, text=title)
+            figure = Figure(figsize=(7, 5), constrained_layout=True)
+            canvas = FigureCanvasTkAgg(figure, master=frame)
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            self.canvases.append((figure, canvas))
+
+        table_frame = ttk.Frame(notebook)
+        notebook.add(table_frame, text="Table")
+        headings = SUMMARY_COLUMNS
+        self.table = ttk.Treeview(table_frame, columns=headings, show="headings")
+        for name in headings:
+            self.table.heading(name, text=name)
+            self.table.column(name, width=95, anchor="e" if name not in ("CCA", "Data") else "w")
+        self.table.pack(fill="both", expand=True)
+
+        self.update_plots()
+
+    def _read_fields(self) -> dict | None:
+        def number(var, default=None):
+            text = var.get().strip()
+            return default if not text else float(text)
+        try:
+            bin_ms = number(self.bin_var, float(COMPARE_DEFAULT_BIN_MS))
+            x_min, x_max = number(self.x_min_var), number(self.x_max_var)
+            period, offset = number(self.period_var, 0.0), number(self.offset_var, 0.0)
+        except ValueError:
+            messagebox.showerror("Invalid value", "All fields must be numbers (or empty).", parent=self)
+            return None
+        if bin_ms <= 0 or period < 0:
+            messagebox.showerror("Invalid value", "Sample interval must be positive, handover period ≥ 0.",
+                                 parent=self)
+            return None
+        return {"bin_ms": bin_ms, "x_min": x_min, "x_max": x_max, "period": period, "offset": offset}
+
+    def _plot_options(self, values: dict) -> dict:
+        starts = [run.t[0] for run in self.runs if run.t]
+        x_min = values["x_min"] if values["x_min"] is not None else (min(starts) if starts else 0.0)
+        x_max = values["x_max"] if values["x_max"] is not None else x_min + COMPARE_DEFAULT_SPAN_S
+        if x_max <= x_min:
+            x_max = x_min + 1.0
+        return {"x_range": (x_min, x_max), "handover": (values["period"], values["offset"])}
+
+    def update_plots(self) -> None:
+        values = self._read_fields()
+        if values is None:
+            return
+        self.config(cursor="watch")
+        self.update_idletasks()
+        try:
+            self.runs, skipped = self.load_runs(max(1, int(values["bin_ms"] * 1_000_000)))
+        except psycopg.Error as error:
+            messagebox.showerror("Loading failed", str(error), parent=self)
+            return
+        finally:
+            self.config(cursor="")
+        self.bin_ms = values["bin_ms"]
+
+        notes = []
+        if skipped:
+            notes.append(f"no data: {', '.join(skipped)}")
+        iperf_only = [run.label for run in self.runs if run.source == "iperf"]
+        if iperf_only:
+            notes.append(f"iperf3 sender data only (no probe): {', '.join(iperf_only)}")
+        self.status_var.set("; ".join(notes))
+
+        styles = run_styles(self.runs)
+        options = self._plot_options(values)
+        for (figure, canvas), (_, _, draw, _) in zip(self.canvases, COMPARE_PLOTS):
+            figure.clear()
+            if self.runs:
+                draw(figure, self.runs, styles, options)
+            else:
+                figure.text(0.5, 0.5, "No data for the selected tests", ha="center", va="center")
+            canvas.draw()
+
+        self.table.delete(*self.table.get_children())
+        for row in summary_rows(self.runs):
+            self.table.insert("", "end", values=[format_cell(v) for v in row])
+
+    def save(self) -> None:
+        if not self.runs:
+            messagebox.showwarning("Nothing to save", "There is no data to save.", parent=self)
+            return
+        values = self._read_fields()
+        if values is None:
+            return
+        folder = filedialog.askdirectory(parent=self, title="Folder for the comparison figures")
+        if not folder:
+            return
+        folder = Path(folder)
+        prefix = self.prefix_var.get().strip() or "compare"
+        styles = run_styles(self.runs)
+        options = self._plot_options(values)
+
+        saved = []
+        try:
+            with matplotlib.rc_context(PAPER_RC):
+                for name, _, draw, height in COMPARE_PLOTS:
+                    figure = Figure(figsize=(PAPER_WIDTH_IN, height), constrained_layout=True)
+                    draw(figure, self.runs, styles, options)
+                    for extension in ("pdf", "png"):
+                        path = folder / f"{prefix}_{name}.{extension}"
+                        figure.savefig(path, dpi=300)
+                        saved.append(path.name)
+
+            csv_path = folder / f"{prefix}_summary.csv"
+            with open(csv_path, "w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(SUMMARY_COLUMNS)
+                for row in summary_rows(self.runs):
+                    writer.writerow([format_cell(v, 3) for v in row])
+            saved.append(csv_path.name)
+
+            tex_path = folder / f"{prefix}_summary.tex"
+            tex_path.write_text(summary_latex(self.runs, self.bin_ms))
+            saved.append(tex_path.name)
+        except OSError as error:
+            messagebox.showerror("Saving failed", str(error), parent=self)
+            return
+
+        messagebox.showinfo("Saved", f"Saved to {folder}:\n\n" + "\n".join(saved), parent=self)
+
+
 def sort_key(value: str):
     """Sort numbers numerically ("0.1" < "0.5" < "10"), everything else alphabetically."""
     try:
@@ -609,17 +1046,44 @@ def main() -> None:
             context_cache[test_name] = fetch_context(tests_by_name[test_name])
         return context_cache[test_name]
 
+    def get_source(test_name: str, source: str, bin_ns: int) -> dict | None:
+        """One source of one test, loaded once per bin size (iperf3 data isn't binned)."""
+        key = (test_name, source, 0 if source == "iperf" else bin_ns)
+        if key not in source_cache:
+            context = get_context(test_name) if source != "iperf" else {}
+            source_cache[key] = fetch_source(tests_by_name[test_name], context, source, bin_ns)
+        return source_cache[key]
+
     def get_data(test_name: str, sources: set[str]) -> dict:
-        """Only the sources the ticked graphs need; each is loaded once per bin size."""
-        data = {}
-        for source in sources:
-            bin_ns = 0 if source == "iperf" else state["bin_ns"]   # iperf3 data isn't binned
-            key = (test_name, source, bin_ns)
-            if key not in source_cache:
-                context = get_context(test_name) if source != "iperf" else {}
-                source_cache[key] = fetch_source(tests_by_name[test_name], context, source, state["bin_ns"])
-            data[source] = source_cache[key]
-        return data
+        """Only the sources the ticked graphs need."""
+        return {source: get_source(test_name, source, state["bin_ns"]) for source in sources}
+
+    def load_runs(test_names: list[str], bin_ns: int) -> tuple[list[RunSummary], list[str]]:
+        """The selected tests as RunSummary objects; names of tests without any data are returned too."""
+        selected = [tests_by_name[name] for name in test_names if name in tests_by_name]
+        runs, skipped = [], []
+        for label, test in zip(run_labels(selected), selected):
+            tcp = get_source(test["name"], "tcp", bin_ns)
+            iperf = None if tcp and tcp["t"] else get_source(test["name"], "iperf", bin_ns)
+            run = summarize_run(label, test, tcp, iperf)
+            if run is None:
+                skipped.append(test["name"])
+            else:
+                runs.append(run)
+        return runs, skipped
+
+    def open_compare() -> None:
+        names = test_list.get()
+        if not names:
+            messagebox.showwarning("No test selected",
+                                   "Select the tests to compare (Ctrl/Shift-click for several).")
+            return
+        try:
+            x_range = (float(x_min_var.get()) if x_min_var.get().strip() else None,
+                       float(x_max_var.get()) if x_max_var.get().strip() else None)
+        except ValueError:
+            x_range = (None, None)
+        CompareWindow(root, names, lambda bin_ns: load_runs(names, bin_ns), x_range)
 
     def plot_tests(test_names: list[str]) -> None:
         selected = sidebar.selected()
@@ -780,6 +1244,9 @@ def main() -> None:
 
         apply_filters()
         plot_tests(test_list.get())
+
+    ttk.Button(controls, text="Compare selected tests…", command=lambda: open_compare()).grid(
+        row=3, column=0, sticky="ew", pady=(10, 0))
 
     ttk.Button(controls, text="Reload from database", command=reload).grid(
         row=4, column=0, sticky="ew", pady=(10, 0))
