@@ -174,6 +174,26 @@ METRICS = [
 
 # --- Data access -------------------------------------------------------------
 
+_database = None
+
+
+def get_db() -> DB:
+    """One connection for the whole viewer; reconnects if it was lost (e.g. Tailscale dropped)."""
+    global _database
+    if _database is None or _database.conn.closed or _database.conn.broken:
+        _database = DB()
+    return _database
+
+
+def run_query(sql_text, params=None):
+    """Query with one automatic retry on a lost connection."""
+    global _database
+    try:
+        return get_db().query(sql_text, params)
+    except psycopg.OperationalError:
+        _database = None
+        return get_db().query(sql_text, params)
+
 def parm_float(test: dict, key: str, default: float) -> float:
     try:
         return float(test["parms"].get(key, default))
@@ -191,8 +211,7 @@ def to_columns(rows, names) -> dict[str, list[float]]:
 
 def fetch_tests() -> list[dict]:
     """Return every test as {"id", "name", "cca", "parms"}."""
-    with DB() as database:
-        rows = list(database.query("SELECT id, name, cca, parms FROM public.tests"))
+    rows = list(run_query("SELECT id, name, cca, parms FROM public.tests") or [])
 
     tests = []
     for test_id, test_name, cca, parms in rows:
@@ -202,8 +221,8 @@ def fetch_tests() -> list[dict]:
     return tests
 
 
-def fetch_iperf(database, test: dict) -> dict:
-    rows = database.query(
+def fetch_iperf(test: dict) -> dict:
+    rows = run_query(
         f"SELECT {', '.join(IPERF_COLUMNS)} FROM public.results WHERE test_id = %s ORDER BY id",
         (test["id"],),
     ) or []
@@ -221,7 +240,7 @@ def add_bin_times(data: dict, bin_ns: int) -> None:
     data["dt"] = [bin_s if i == 0 else (b - bins[i - 1]) * bin_s for i, b in enumerate(bins)]
 
 
-def fetch_tcp(database, test_id, t0: int, bin_ns: int, where: str, params: dict) -> dict:
+def fetch_tcp(test_id, t0: int, bin_ns: int, where: str, params: dict) -> dict:
     names, select = ["bin"], ["(t_ns - %(t0)s) / %(bin)s"]
     for c in TCP_AVG:
         names.append(f"avg_{c}"); select.append(f"avg({c})")
@@ -232,7 +251,7 @@ def fetch_tcp(database, test_id, t0: int, bin_ns: int, where: str, params: dict)
     for c in TCP_COUNTERS:
         names += [f"first_{c}", f"last_{c}"]; select += [f"min({c})", f"max({c})"]
 
-    rows = database.query(
+    rows = run_query(
         f"""
         SELECT {', '.join(select)}
         FROM public.tcp_samples
@@ -254,10 +273,10 @@ def fetch_tcp(database, test_id, t0: int, bin_ns: int, where: str, params: dict)
     return data
 
 
-def fetch_cubic(database, test_id, t0: int, bin_ns: int, where: str, params: dict) -> dict:
+def fetch_cubic(test_id, t0: int, bin_ns: int, where: str, params: dict) -> dict:
     names = ["bin"] + [f"max_{c}" for c in CUBIC_COLUMNS]
     select = ["(t_ns - %(t0)s) / %(bin)s"] + [f"max({c})" for c in CUBIC_COLUMNS]
-    rows = database.query(
+    rows = run_query(
         f"""
         SELECT {', '.join(select)}
         FROM public.cubic_samples
@@ -272,11 +291,11 @@ def fetch_cubic(database, test_id, t0: int, bin_ns: int, where: str, params: dic
     return data
 
 
-def fetch_irtt(database, test_id, t0: int, bin_ns: int) -> dict:
+def fetch_irtt(test_id, t0: int, bin_ns: int) -> dict:
     names = ["bin"] + [name for name, _ in IRTT_AGGREGATES]
     # floor(), not integer division: irtt starts before the probe, so times can be negative
     select = ["floor((t_ns - %(t0)s)::float8 / %(bin)s)::bigint"] + [agg for _, agg in IRTT_AGGREGATES]
-    rows = database.query(
+    rows = run_query(
         f"""
         SELECT {', '.join(select)}
         FROM public.irtt_samples
@@ -291,58 +310,78 @@ def fetch_irtt(database, test_id, t0: int, bin_ns: int) -> dict:
     return data
 
 
-def data_connection_filters(database, test_id) -> tuple[str, str, dict]:
+def data_connection_filters(test_id) -> tuple[str, str, dict]:
     """SQL conditions that keep only the iperf3 data connection.
 
     The probe also sees iperf3's control connection (same server port).
     Mixing the two breaks the counters, e.g. a hugely negative goodput.
-    - Logs with a sport column: keep the socket that ACKed the most bytes.
+    - Logs with a sport column: the socket that ACKed the most bytes. Looking at the
+      last 20 000 samples is enough and fast (it uses the time index instead of
+      reading the whole test).
     - Older logs without sport: drop samples whose bytes_acked is below
       0.1 % of the maximum (the control connection only sends a few KB).
     Returns (tcp_where, cubic_where, params).
     """
-    sport, max_acked = database.query(
+    rows = run_query(
         """
-        SELECT (SELECT sport FROM public.tcp_samples
-                WHERE test_id = %(id)s AND sport IS NOT NULL
-                ORDER BY bytes_acked DESC LIMIT 1),
-               max(bytes_acked)
-        FROM public.tcp_samples WHERE test_id = %(id)s
+        SELECT sport, max(bytes_acked) FROM (
+            SELECT sport, bytes_acked FROM public.tcp_samples
+            WHERE test_id = %(id)s
+            ORDER BY t_ns DESC LIMIT 20000
+        ) recent
+        GROUP BY sport
+        ORDER BY 2 DESC NULLS LAST
+        LIMIT 1
         """,
         {"id": test_id},
-    )[0]
+    )
+    sport = rows[0][0] if rows else None
     if sport is not None:
         # CUBIC logs without a sport column are kept whole
         return "sport = %(sport)s", "(sport = %(sport)s OR sport IS NULL)", {"sport": sport}
+    max_acked = run_query(
+        "SELECT max(bytes_acked) FROM public.tcp_samples WHERE test_id = %s", (test_id,)
+    )[0][0]
     return "bytes_acked >= %(min_acked)s", "TRUE", {"min_acked": (max_acked or 0) // 1000}
 
 
-def fetch_test_data(test: dict, bin_ns: int) -> dict:
-    """All data for one test: {"iperf": {...}, "tcp": {...}, "cubic": {...}}.
+def fetch_context(test: dict) -> dict:
+    """Per test, independent of bin size: which connection to use and where time 0 is.
 
     Probe times are seconds since the data connection's first probe sample.
+    t0 is None when the test has no probe or irtt data.
     """
-    with DB() as database:
-        data = {"iperf": fetch_iperf(database, test)}
-        tcp_where, cubic_where, params = data_connection_filters(database, test["id"])
-        t0 = database.query(
-            f"SELECT min(t_ns) FROM public.tcp_samples WHERE test_id = %(id)s AND {tcp_where}",
+    tcp_where, cubic_where, params = data_connection_filters(test["id"])
+    t0 = run_query(
+        f"SELECT min(t_ns) FROM public.tcp_samples WHERE test_id = %(id)s AND {tcp_where}",
+        {**params, "id": test["id"]},
+    )[0][0]
+    if t0 is None:
+        t0 = run_query(
+            f"SELECT min(t_ns) FROM public.cubic_samples WHERE test_id = %(id)s AND {cubic_where}",
             {**params, "id": test["id"]},
         )[0][0]
-        if t0 is None:
-            t0 = database.query(
-                f"SELECT min(t_ns) FROM public.cubic_samples WHERE test_id = %(id)s AND {cubic_where}",
-                {**params, "id": test["id"]},
-            )[0][0]
-        if t0 is None:
-            t0 = database.query(
-                "SELECT min(t_ns) FROM public.irtt_samples WHERE test_id = %s", (test["id"],)
-            )[0][0]
-        if t0 is not None:
-            data["tcp"] = fetch_tcp(database, test["id"], t0, bin_ns, tcp_where, params)
-            data["cubic"] = fetch_cubic(database, test["id"], t0, bin_ns, cubic_where, params)
-            data["irtt"] = fetch_irtt(database, test["id"], t0, bin_ns)
-    return data
+    if t0 is None:
+        t0 = run_query(
+            "SELECT min(t_ns) FROM public.irtt_samples WHERE test_id = %s", (test["id"],)
+        )[0][0]
+    return {"t0": t0, "tcp_where": tcp_where, "cubic_where": cubic_where, "params": params}
+
+
+def fetch_source(test: dict, context: dict, source: str, bin_ns: int) -> dict | None:
+    """One data source ("iperf", "tcp", "cubic" or "irtt") for one test."""
+    if source == "iperf":
+        return fetch_iperf(test)
+    t0 = context["t0"]
+    if t0 is None:
+        return None
+    if source == "tcp":
+        return fetch_tcp(test["id"], t0, bin_ns, context["tcp_where"], context["params"])
+    if source == "cubic":
+        return fetch_cubic(test["id"], t0, bin_ns, context["cubic_where"], context["params"])
+    if source == "irtt":
+        return fetch_irtt(test["id"], t0, bin_ns)
+    return None
 
 
 def sort_key(value: str):
@@ -558,17 +597,29 @@ def main() -> None:
 
     tests: list[dict] = []
     tests_by_name: dict[str, dict] = {}
-    data_cache: dict[tuple[str, int], dict] = {}
+    context_cache: dict[str, dict] = {}                     # test -> connection filter and t0
+    source_cache: dict[tuple[str, str, int], dict | None] = {}   # (test, source, bin) -> data
     param_filters: dict[str, FilterList] = {}
     details_var = tk.StringVar()
     line_plot_var = tk.BooleanVar(value=False)
     state = {"bin_ns": DEFAULT_BIN_MS * 1_000_000, "axes": []}
 
-    def get_data(test_name: str) -> dict:
-        key = (test_name, state["bin_ns"])
-        if key not in data_cache:
-            data_cache[key] = fetch_test_data(tests_by_name[test_name], state["bin_ns"])
-        return data_cache[key]
+    def get_context(test_name: str) -> dict:
+        if test_name not in context_cache:
+            context_cache[test_name] = fetch_context(tests_by_name[test_name])
+        return context_cache[test_name]
+
+    def get_data(test_name: str, sources: set[str]) -> dict:
+        """Only the sources the ticked graphs need; each is loaded once per bin size."""
+        data = {}
+        for source in sources:
+            bin_ns = 0 if source == "iperf" else state["bin_ns"]   # iperf3 data isn't binned
+            key = (test_name, source, bin_ns)
+            if key not in source_cache:
+                context = get_context(test_name) if source != "iperf" else {}
+                source_cache[key] = fetch_source(tests_by_name[test_name], context, source, state["bin_ns"])
+            data[source] = source_cache[key]
+        return data
 
     def plot_tests(test_names: list[str]) -> None:
         selected = sidebar.selected()
@@ -586,11 +637,12 @@ def main() -> None:
         for axis in axes:
             axis.grid(True, alpha=0.3)
 
+        needed = {metric.source for metric in selected}
         missing_probe = []
         for test_name in test_names:
             test = tests_by_name[test_name]
-            data = get_data(test_name)
-            if not data.get("tcp", {}).get("t"):
+            data = get_data(test_name, needed)
+            if get_context(test_name)["t0"] is None:
                 missing_probe.append(test_name)
             omit = max(0.0, parm_float(test, "omit", 0.0))
             label = f"{test['cca']} {test_name}"
@@ -710,7 +762,8 @@ def main() -> None:
         tests = fetch_tests()
         tests_by_name.clear()
         tests_by_name.update({test["name"]: test for test in tests})
-        data_cache.clear()
+        context_cache.clear()
+        source_cache.clear()
 
         cca_filter.set_values(test["cca"] for test in tests)
 
@@ -730,6 +783,8 @@ def main() -> None:
 
     ttk.Button(controls, text="Reload from database", command=reload).grid(
         row=4, column=0, sticky="ew", pady=(10, 0))
+    root.bind("<F5>", lambda event: reload())
+    root.bind("<Control-r>", lambda event: reload())
 
     def delete_selected() -> None:
         names = test_list.get()
@@ -745,8 +800,7 @@ def main() -> None:
             return
 
         try:
-            with DB() as database:
-                deleted = database.delete_tests_by_name(names)
+            deleted = get_db().delete_tests_by_name(names)
         except psycopg.Error as error:
             messagebox.showerror("Remove test failed", str(error))
             return
@@ -853,6 +907,8 @@ def main() -> None:
     canvas.mpl_connect("button_release_event", on_release)
 
     def close() -> None:
+        if _database is not None:
+            _database.close()
         figure.clear()
         root.quit()
         root.destroy()

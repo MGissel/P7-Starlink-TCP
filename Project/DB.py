@@ -86,8 +86,6 @@ class DB:
         # Password is read automatically from ~/.pgpass
         self.conn = self._connect()
         self.needs_migration = False
-        with self.conn.cursor() as cur:
-            cur.execute("CREATE SCHEMA IF NOT EXISTS public")
         self.create_tables()
 
     @classmethod
@@ -97,20 +95,38 @@ class DB:
     # --- Schema -------------------------------------------------------------
 
     def create_tables(self):
+        """Create missing tables and columns.
+
+        Everything is sent in one batch (one round trip), because over Tailscale each
+        separate statement costs a noticeable delay, and this runs on every connection.
+        """
         with self.conn.cursor() as cur:
-            for statement in self.SCHEMA:
-                cur.execute(statement)
+            cur.execute(
+                """
+                SELECT c.relname, c.relkind FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relname = ANY(%s)
+                """,
+                (list(PROBE_COLUMNS),),
+            )
+            kinds = dict(cur.fetchall())
+
+            statements = [sql.SQL("CREATE SCHEMA IF NOT EXISTS public")]
+            statements += [sql.SQL(statement) for statement in self.SCHEMA]
             for table, columns in PROBE_COLUMNS.items():
-                kind = self._relkind(cur, table)
+                kind = kinds.get(table)
                 if kind is None:
-                    self._create_probe_parent(cur, table)
+                    statements += self._probe_parent_sql(table)
                 elif kind == "r":
                     # Old layout (one big table). Still readable; run migrate_probe_tables()
                     self.needs_migration = True
                 for name, col_type in columns:
                     if "NOT NULL" not in col_type:
-                        cur.execute(sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}").format(
+                        statements.append(sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}").format(
                             sql.Identifier("public", table), sql.Identifier(name), sql.SQL(col_type)))
+
+            # Without parameters, several statements can go in one execute()
+            cur.execute("; ".join(statement.as_string(self.conn) for statement in statements))
         self.conn.commit()
         if self.needs_migration:
             print("Note: the probe tables use the old layout. Run `python DB.py` once to convert them.")
@@ -130,16 +146,24 @@ class DB:
         return row[0] if row else None
 
     @staticmethod
-    def _create_probe_parent(cur, table):
+    def _probe_parent_sql(table):
+        """Statements that create one partitioned probe table and its time index."""
         columns = sql.SQL(", ").join(
             sql.SQL("{} {}").format(sql.Identifier(name), sql.SQL(col_type))
             for name, col_type in [("test_id", "UUID NOT NULL")] + PROBE_COLUMNS[table]
         )
-        cur.execute(sql.SQL("CREATE TABLE {} ({}) PARTITION BY LIST (test_id)").format(
-            sql.Identifier("public", table), columns))
-        # Within a partition test_id is constant, so the index only needs the time
-        cur.execute(sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (t_ns)").format(
-            sql.Identifier(f"{table}_t_idx"), sql.Identifier("public", table)))
+        return [
+            sql.SQL("CREATE TABLE {} ({}) PARTITION BY LIST (test_id)").format(
+                sql.Identifier("public", table), columns),
+            # Within a partition test_id is constant, so the index only needs the time
+            sql.SQL("CREATE INDEX IF NOT EXISTS {} ON {} (t_ns)").format(
+                sql.Identifier(f"{table}_t_idx"), sql.Identifier("public", table)),
+        ]
+
+    @classmethod
+    def _create_probe_parent(cls, cur, table):
+        for statement in cls._probe_parent_sql(table):
+            cur.execute(statement)
 
     @staticmethod
     def _partition_name(table, test_id):
