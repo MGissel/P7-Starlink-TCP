@@ -64,6 +64,7 @@ static u64 cube_factor __read_mostly;
 #define WINDOW_SIZE (400)
 #define RESTORE_RANGE (400)
 #define Z_SCORE_THRESHOLD (21)
+#define LOSS_TRESHOLD (2)
 #define CLAMP(x, high) (((x) > (high)) ? (high) : (x))
 
 
@@ -113,7 +114,7 @@ struct bictcp {
 	u16 loss_event_timer;
 	u32 moving_mean;
 	u16 cwnd_max_counter[2];
-
+	u16 loss_counter[2];
 };
 
 static inline void bictcp_reset(struct bictcp *ca)
@@ -345,6 +346,7 @@ __bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	ca->loss_event_timer = CLAMP(ca->loss_event_timer + 1, WINDOW_SIZE+1);
 	ca->thresh_counter = CLAMP(ca->thresh_counter + 1, WINDOW_SIZE+1);
 	ca->cwnd_max_counter[1] += 1;
+	ca->loss_counter[1] +=1;
 	//tp->rack.rtt_us
 	//tp->srtt_us
 	ca->moving_mean = (tp->rack.rtt_us + CLAMP(ca->counter-1, WINDOW_SIZE-1)*(u64)ca->moving_mean) / ca->counter;
@@ -357,7 +359,6 @@ __bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		ca->thresh_counter = 0;
 	}
 	
-
 	//If we exceed the z_score threshold shortly after a loss event. 
 	if (curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < RESTORE_RANGE && tcp_snd_cwnd(tp)< max(ca->cwnd_max_counter[0], tp->prior_cwnd)){
 		tp->snd_cwnd = max(ca->cwnd_max_counter[0], tp->prior_cwnd);
@@ -366,6 +367,11 @@ __bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	if (ca->cwnd_max_counter[1] > RESTORE_RANGE){
 		ca->cwnd_max_counter[0] = 0; //reset cwnd as we might not yet have a new prior cwnd
 		ca->cwnd_max_counter[1] = 0; //Reset counter 
+	}
+
+	if (ca->loss_counter[1] > RESTORE_RANGE){ //Might replace the range with something elese in the future 
+		ca->loss_counter[0] = 0; //Reset number of loss events
+		ca->loss_counter[1] = 0; //Reset counter 
 	}
 
 
@@ -396,6 +402,12 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 	}
 
 	else {
+		//Checks if number of loss events 
+		ca->loss_counter[0] +=1;
+		if (ca->loss_counter[0] < LOSS_TRESHOLD){
+			return tp->prior_cwnd;
+		}
+
 		//Check if last max window is larger than current min in cwnd matrix 
 		if ((tp->prior_cwnd > ca->cwnd_max_counter[0])){
 			ca->cwnd_max_counter[0] = tp->prior_cwnd; //set to prior cwnd
@@ -418,7 +430,7 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 __bpf_kfunc static void cubictcp_state(struct sock *sk, u8 new_state)
 {
 	struct bictcp *ca = inet_csk_ca(sk);
-	if (new_state == TCP_CA_Loss && !(ca->thresh_counter < WINDOW_SIZE)) {
+	if (new_state == TCP_CA_Loss && (ca->thresh_counter > WINDOW_SIZE) && (ca->loss_counter[0] > LOSS_TRESHOLD)) {
 		bictcp_reset(inet_csk_ca(sk));
 		bictcp_hystart_reset(sk);
 	}
