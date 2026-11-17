@@ -27,6 +27,12 @@
 #include <linux/mm.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
+
+#ifndef BTF_KFUNCS_START
+#define BTF_KFUNCS_START(name) BTF_SET8_START(name)
+#define BTF_KFUNCS_END(name)   BTF_SET8_END(name)
+#endif
+
 #include <linux/module.h>
 #include <linux/math64.h>
 #include <net/tcp.h>
@@ -336,7 +342,7 @@ tcp_friendliness:
 	ca->cnt = max(ca->cnt, 2U);
 }
 
-__bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
+__bpf_kfunc static void zscore_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
@@ -551,7 +557,7 @@ __bpf_kfunc static void cubictcp_acked(struct sock *sk, const struct ack_sample 
 static struct tcp_congestion_ops cubictcp __read_mostly = {
 	.init		= cubictcp_init,
 	.ssthresh	= cubictcp_recalc_ssthresh,
-	.cong_avoid	= cubictcp_cong_avoid,
+	.cong_avoid	= zscore_cong_avoid,
 	.set_state	= cubictcp_state,
 	.undo_cwnd	= tcp_reno_undo_cwnd,
 	.cwnd_event	= cubictcp_cwnd_event,
@@ -563,7 +569,7 @@ static struct tcp_congestion_ops cubictcp __read_mostly = {
 BTF_KFUNCS_START(tcp_cubic_check_kfunc_ids)
 BTF_ID_FLAGS(func, cubictcp_init)
 BTF_ID_FLAGS(func, cubictcp_recalc_ssthresh)
-BTF_ID_FLAGS(func, cubictcp_cong_avoid)
+BTF_ID_FLAGS(func, zscore_cong_avoid)
 BTF_ID_FLAGS(func, cubictcp_state)
 BTF_ID_FLAGS(func, cubictcp_cwnd_event)
 BTF_ID_FLAGS(func, cubictcp_acked)

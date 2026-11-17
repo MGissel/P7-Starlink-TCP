@@ -113,11 +113,12 @@ kfunc:vmlinux:cubictcp_cong_avoid
 		$ca->cnt, $ca->delay_min, args->sk->__sk_common.skc_num);
 }
 
-kfunc:cubic_z_score_e:cubictcp_cong_avoid
-/args->sk->__sk_common.skc_dport == 20756/
+kprobe:zscore_cong_avoid
+/((struct sock *)arg0)->__sk_common.skc_dport == 20756/
 {
-	$ca = (struct bictcp *)((uint64)args->sk + offsetof(struct inet_connection_sock, icsk_ca_priv));
-	printf("CUBIC %llu w_max=%u K=%u epoch_start=%u cnt=%u delay_min=%u sport=%u\n",
+	$sk = (struct sock *)arg0;
+	$ca = (struct bictcp *)((uint64)$sk + offsetof(struct inet_connection_sock, icsk_ca_priv));
+	printf("ZCUBIC %llu w_max=%u K=%u epoch_start=%u cnt=%u delay_min=%u sport=%u\n",
 		nsecs, $ca->last_max_cwnd, $ca->bic_K, $ca->epoch_start,
-		$ca->cnt, $ca->delay_min, args->sk->__sk_common.skc_num);
+		$ca->cnt, $ca->delay_min, $sk->__sk_common.skc_num);
 }
