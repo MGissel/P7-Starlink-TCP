@@ -62,7 +62,8 @@ static u32 beta_scale __read_mostly;
 static u64 cube_factor __read_mostly;
 
 #define WINDOW_SIZE (400)
-#define Z_SCORE_THRESHOLD (17)
+#define RESTORE_RANGE (400)
+#define Z_SCORE_THRESHOLD (21)
 #define CLAMP(x, high) (((x) > (high)) ? (high) : (x))
 
 
@@ -107,16 +108,11 @@ struct bictcp {
 	u32	end_seq;	/* end_seq of the round */
 	u32	last_ack;	/* last time when the ACK spacing is close */
 	u32	curr_rtt;	/* the minimum rtt of current round */
-	u32 curr_z;
-	u32 counter;
-	u32 bic_target;
-	u32 thresh_range;
-	u32 thresh_counter;
-	s32 difference;
-	u32 ssthresh;
-	u32 loss_event_timer;
-	u32 loss_event_cwnd;
-	u64 moving_mean;
+	u16 counter;
+	u16 thresh_counter;
+	u16 loss_event_timer;
+	u32 moving_mean;
+	u16 cwnd_max_counter[2];
 
 };
 
@@ -147,6 +143,8 @@ __bpf_kfunc static void cubictcp_init(struct sock *sk)
 	struct bictcp *ca = inet_csk_ca(sk);
 
 	bictcp_reset(ca);
+	//memset(ca->cwnd_max_counter,0,sizeof(ca->cwnd_max_counter))
+
 
 	if (hystart)
 		bictcp_hystart_reset(sk);
@@ -233,7 +231,6 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd, u32 acked)
 	u64 offs, t;
 
 	ca->ack_cnt += acked;	/* count the number of ACKed packets */
-	ca->difference = (ca->last_cwnd == cwnd && (s32)(tcp_jiffies32 - ca->last_time) <= HZ / 32);
 	if (ca->last_cwnd == cwnd &&
 	    (s32)(tcp_jiffies32 - ca->last_time) <= HZ / 32)
 		
@@ -299,7 +296,6 @@ static inline void bictcp_update(struct bictcp *ca, u32 cwnd, u32 acked)
 	else                                          /* above origin*/
 		bic_target = ca->bic_origin_point + delta;
 
-	ca->bic_target = bic_target;
 		/* cubic function - calc bictcp_cnt*/
 	if (bic_target > cwnd) {
 		ca->cnt = cwnd / (bic_target - cwnd);
@@ -348,28 +344,33 @@ __bpf_kfunc static void cubictcp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	ca->counter = CLAMP(ca->counter+1, WINDOW_SIZE);
 	ca->loss_event_timer = CLAMP(ca->loss_event_timer + 1, WINDOW_SIZE+1);
 	ca->thresh_counter = CLAMP(ca->thresh_counter + 1, WINDOW_SIZE+1);
+	ca->cwnd_max_counter[1] += 1;
 	//tp->rack.rtt_us
 	//tp->srtt_us
-	ca->moving_mean = (tp->rack.rtt_us + CLAMP(ca->counter-1, WINDOW_SIZE-1)*ca->moving_mean) / ca->counter;
+	ca->moving_mean = (tp->rack.rtt_us + CLAMP(ca->counter-1, WINDOW_SIZE-1)*(u64)ca->moving_mean) / ca->counter;
 
-	ca->curr_z = (10*(u64)tp->rack.rtt_us)/ca->moving_mean;
+
+	u32 curr_z = (10*(u64)tp->rack.rtt_us)/ca->moving_mean;
 	
 
-	if (ca->curr_z >= Z_SCORE_THRESHOLD){
+	if (curr_z >= Z_SCORE_THRESHOLD){
 		ca->thresh_counter = 0;
 	}
 	
-	ca->thresh_range = ca->thresh_counter < WINDOW_SIZE;
-	ca->ssthresh = max((tcp_snd_cwnd(tp) * beta) / BICTCP_BETA_SCALE, 2U);
-	
 
-	if (ca->curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE){
-		tp->snd_cwnd = tp->prior_cwnd;
+	//If we exceed the z_score threshold shortly after a loss event. 
+	if (curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < RESTORE_RANGE && tcp_snd_cwnd(tp)< max(ca->cwnd_max_counter[0], tp->prior_cwnd)){
+		tp->snd_cwnd = max(ca->cwnd_max_counter[0], tp->prior_cwnd);
 	}
 
-	
-	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%u, Bictarget,%u, thresh_range,%u, thresh_c,%u, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, diff_bool,%u, prior_cwnd,%u, ssthresh,%u, reset_old,%d, SRTT,%u", 
-		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), ca->curr_z, ca->bic_target, ca->thresh_range, ca->thresh_counter, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, ca->difference, tp->prior_cwnd, ca->ssthresh, ca->curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE, tp->srtt_us);
+	if (ca->cwnd_max_counter[1] > RESTORE_RANGE){
+		ca->cwnd_max_counter[0] = 0; //reset cwnd as we might not yet have a new prior cwnd
+		ca->cwnd_max_counter[1] = 0; //Reset counter 
+	}
+
+
+	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%u, thresh_counter_before,%u, thresh_range_before,%u, thresh_counter_after,%u, thresh_range_after,%d, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, prior_cwnd,%u, array[%u,%u]", 
+		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), curr_z, ca->thresh_counter, (ca->thresh_counter < WINDOW_SIZE), ca->loss_event_timer, curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, tp->prior_cwnd, ca->cwnd_max_counter[0], ca->cwnd_max_counter[1]);
 
 	if (!tcp_is_cwnd_limited(sk))
 		return;
@@ -389,13 +390,18 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
-	ca->loss_event_cwnd = tcp_snd_cwnd(tp);
-	if (ca->thresh_range){
+
+	if (ca->thresh_counter < WINDOW_SIZE){
 		return tp->prior_cwnd;
 	}
 
 	else {
-		
+		//Check if last max window is larger than current min in cwnd matrix 
+		if ((tp->prior_cwnd > ca->cwnd_max_counter[0])){
+			ca->cwnd_max_counter[0] = tp->prior_cwnd; //set to prior cwnd
+			ca->cwnd_max_counter[1] = 0; //Reset counter 
+		}
+
 		ca->loss_event_timer = 0;
 		//ca->epoch_start_max = ca->epoch_start;
 		ca->epoch_start = 0;	/* end of epoch */ //Tells update to recalc a new bic_target
@@ -412,7 +418,7 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 __bpf_kfunc static void cubictcp_state(struct sock *sk, u8 new_state)
 {
 	struct bictcp *ca = inet_csk_ca(sk);
-	if (new_state == TCP_CA_Loss && !ca->thresh_range) {
+	if (new_state == TCP_CA_Loss && !(ca->thresh_counter < WINDOW_SIZE)) {
 		bictcp_reset(inet_csk_ca(sk));
 		bictcp_hystart_reset(sk);
 	}
