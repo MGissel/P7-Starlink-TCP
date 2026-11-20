@@ -69,7 +69,7 @@ static u64 cube_factor __read_mostly;
 
 #define WINDOW_SIZE (400)
 #define RESTORE_RANGE (400)
-#define Z_SCORE_THRESHOLD (21)
+#define SCORE_THRESHOLD (21)
 #define LOSS_TRESHOLD (2)
 #define CLAMP(x, high) (((x) > (high)) ? (high) : (x))
 
@@ -361,12 +361,12 @@ __bpf_kfunc static void zscore_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	u32 curr_z = (10*(u64)tp->rack.rtt_us)/ca->moving_mean;
 	
 
-	if (curr_z >= Z_SCORE_THRESHOLD){
+	if (curr_z >= SCORE_THRESHOLD){
 		ca->thresh_counter = 0;
 	}
 	
 	//If we exceed the z_score threshold shortly after a loss event. 
-	if (curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < RESTORE_RANGE && tcp_snd_cwnd(tp)< max(ca->cwnd_max_counter[0], tp->prior_cwnd)){
+	if (curr_z >= SCORE_THRESHOLD && ca->loss_event_timer < RESTORE_RANGE && tcp_snd_cwnd(tp)< max(ca->cwnd_max_counter[0], tp->prior_cwnd)){
 		tp->snd_cwnd = max(ca->cwnd_max_counter[0], tp->prior_cwnd);
 	}
 
@@ -382,7 +382,7 @@ __bpf_kfunc static void zscore_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 
 	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%u, thresh_counter_before,%u, thresh_range_before,%u, thresh_counter_after,%u, thresh_range_after,%d, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, prior_cwnd,%u, array[%u,%u]", 
-		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), curr_z, ca->thresh_counter, (ca->thresh_counter < WINDOW_SIZE), ca->loss_event_timer, curr_z >= Z_SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, tp->prior_cwnd, ca->cwnd_max_counter[0], ca->cwnd_max_counter[1]);
+		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), curr_z, ca->thresh_counter, (ca->thresh_counter < WINDOW_SIZE), ca->loss_event_timer, curr_z >= SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, tp->prior_cwnd, ca->cwnd_max_counter[0], ca->cwnd_max_counter[1]);
 
 	if (!tcp_is_cwnd_limited(sk))
 		return;
