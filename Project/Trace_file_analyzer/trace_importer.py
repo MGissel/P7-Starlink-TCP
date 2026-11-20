@@ -88,11 +88,16 @@ def import_tracefile(file,window_size = 100,moving = True):
         return sliced_average(raw_trace_data,window_size)
 
 
-def plot_moving_mean(file,data,window_size,moving=True,normalize=False):
+def plot_moving_mean(file,data,window_size,moving=True,normalize=False,time_slice = [0,np.inf]):
 
     trace_data = import_tracefile(file,window_size,moving)
 
-    Axis_Labels = np.array(["Time (s)","Latency (ms)","Rate (bits/s)","Loss (%)","Limit (Queue Size)"])
+    mask1 = (time_slice[0] <= trace_data[:,TI().KEEP])
+    mask2 = (trace_data[:,TI().KEEP]  <= time_slice[1])
+    mask = mask1 == mask2
+    trace_data = trace_data[mask]
+
+    Axis_Labels = np.array(["Time (s)","Latency (ms)","Rate (Mb/s)","Loss (%)","Limit (Queue Size)"])
     Desc_Labels = np.array(["Time","Latency","Rate","Packet loss Propability","Limit"])
 
 
@@ -101,7 +106,16 @@ def plot_moving_mean(file,data,window_size,moving=True,normalize=False):
 
 
     if normalize == False:
-        plt.plot(trace_data[:,TI().KEEP],trace_data[:,data],label=Desc_Labels[data])
+
+        for i in data:
+            if i == TI().RATE:
+                plt.plot(trace_data[:,TI().KEEP],trace_data[:,i]/10**6,label=f"rate Mb (mean {trace_data[:,i].mean()/(10**6)})")
+            else:
+                plt.plot(trace_data[:,TI().KEEP],trace_data[:,data],label=Desc_Labels[data])
+
+
+
+
     else:
         for i in data:
 
@@ -141,7 +155,7 @@ if __name__ == "__main__":
     #import_tracefile(new_file,moving=False)
 
 
-    plot_moving_mean(new_file,[TI().LOSS,TI().RATE],50,False,True)
+    plot_moving_mean(file,[TI().RATE],100,False,False,[0,600])
 
 
 
