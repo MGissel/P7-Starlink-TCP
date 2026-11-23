@@ -2,82 +2,70 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import sys 
-
-
+from numba import njit 
 
 def process_data(test_name):
-    data = np.loadtxt(f"{Path.home()}/P7-Starlink-TCP/Project/kernel_cca/{test_name}/test.log", delimiter=",", dtype=str)
-    data_matrix = np.zeros((np.shape(data)[0], 5))
+    data = np.loadtxt(f"{Path.home()}/P7-Starlink-TCP/Project/kernel_cca/{test_name}/test.log", delimiter=",", dtype=str, usecols=(0,2,6,8,16))
 
-    time = np.strings.strip(data[:,0], "[")
-    data_matrix[:,0] = np.strings.strip(time, "] ").astype(dtype=float) #data_matrix[0]
-
-    data_matrix[:,1] = data[:,2].astype(dtype=int) #RTT
-    data_matrix[:,2] = data[:,6].astype(dtype=int) #CWND
-    data_matrix[:,3] = data[:,8].astype(dtype=int) #Z_score
-    data_matrix[:,4] = data[:,40].astype(dtype=int) #SRTT WIll be moved elsewhere at somepoint 
-
-    return data_matrix
+    data[:,0] = np.strings.strip(data[:,0], "[")
+    data[:,0] = np.strings.strip(data[:,0], "] ")
+    return data.astype(dtype=float)
 
 
-def save_data(test_name, data_matrix):
-    print(f"{test_name} missing")
-    path = f"{Path.home()}/P7-Starlink-TCP/Project/kernel_cca/{test_name}/"
-    np.save(path + "test.npy", data_matrix)
-    np.save(path + "test_crc.npy", data_matrix[0,0])
+def plot_data(data_matrix, threshold, start, end, compare, relative_time = False):
+    nrows = np.shape(data_matrix)[1]-2 
+    fig, ax = plt.subplots(nrows = nrows, ncols=1)
 
-def load_data(test_name):
-    print(f"{test_name} exists")
-    path = f"{Path.home()}/P7-Starlink-TCP/Project/kernel_cca/{test_name}/"
+    time = data_matrix[:, 0]
 
-    data_matrix = np.load(path + "test.npy")
-    load_crc = np.load(path + "test_crc.npy")
-
-    if  np.loadtxt(path + "test.log", delimiter=",", dtype=str, max_rows=1, usecols=0) != f"[{load_crc}] ":
-        print(f"{test_name} changed")
-        data_matrix = process_data(test_name)
-        save_data(test_name, data_matrix)
-
-
-    return data_matrix
-
-
-def plot_data(data_matrix, threshold, start, end, compare, test_name):
-    fig, ax = plt.subplots(nrows = np.shape(data_matrix)[1]-1, ncols=1)
-    
-    time = data_matrix[:, 0] - data_matrix[0, 0]
+    if relative_time:
+        time -= time[0] 
+    else:
+        start += time[0]
 
     end = np.max(time)-end
+
+    
+
 
     time_mask = (start < time) & (time < end)
     time = time[time_mask]
 
-    z_score = data_matrix[:,3][time_mask]
     rtt = data_matrix[:,1][time_mask]
     cwnd = data_matrix[:,2][time_mask]
-    srtt = data_matrix[:,4][time_mask]
+    z_score = data_matrix[:,3][time_mask]
+    loss_event_restore = data_matrix[:,4][time_mask]
+    loss_event_restore.astype(dtype=bool)
 
-    #Z_SCORE
+    #CWND reduction events 
+    cwnd_reduction_times = time[:-1][np.diff(cwnd) < 0]
+    cwnd_reduction_events = len(cwnd_reduction_times)
+    cwnd_matrix = np.zeros((cwnd_reduction_events, 2))
+    cwnd_matrix[:,0] =  np.where(np.diff(data_matrix[:,2]) < 0)[0][-cwnd_reduction_events:]
+    cwnd_matrix[:,1] = time[:-1][np.diff(cwnd) < 0]
+   
+    print(cwnd_matrix) #Printing only relevant lines
+
+
 
     ax[0].scatter(time, z_score, label=f"z_scores_k", marker=".", s=1)
     if compare.any():
         ax[0].scatter(time, compare[time_mask], label=f"Window based", marker=".", s=1, alpha=0.4)    
         
     ax[0].hlines(y=threshold, xmin=time[0], xmax=time[-1], colors=["r"])
+    ax[0].scatter(cwnd_reduction_times, threshold*np.ones(len(cwnd_reduction_times)), c="black", marker="x", s=3)
     ax[0].legend() 
     
     #RTT
     ax[1].scatter(time, rtt, label=f"rtt", marker=".", s=1)
     ax[1].legend() 
 
-    #SRTT
-    ax[2].scatter(time, srtt, label=f"srtt", marker=".", s=1)
-    ax[2].legend() 
-
     #CWND
-    ax[3].scatter(time, cwnd, label=f"cwnd", marker=".", s=1)
-    ax[3].scatter(time[z_score >= threshold], cwnd[ z_score >= threshold], label=f"threshold", marker=".", s=3, c="r")
-    ax[3].legend() 
+    ax[2].scatter(time, cwnd, label=f"cwnd", marker=".", s=1)
+    ax[2].scatter(time[z_score >= threshold], cwnd[ z_score >= threshold], label=f"threshold", marker=".", s=5, c="r")
+    ax[2].scatter(time[loss_event_restore==True], cwnd[loss_event_restore==True], label="Threshold_After", marker=".", s=5, c="green")
+    #ax[2].vlines(time[:-1][np.diff(cwnd) < 0], 0, max(cwnd), colors="black")
+    ax[2].legend()  
 
     #plt.tight_layout()
     #plt.savefig(f"{Path.home()}/P7-Starlink-TCP/Project/kernel_cca/{test_name}/test.pdf")
@@ -97,28 +85,32 @@ def compare_z(rtt, window_size):
 
     return z_score
 
+@njit(parallel=False)
+def compare_z_normal(rtt, window_size):
+    window = np.zeros(window_size)
+    rtt_length = len(rtt)
+    z_score = np.zeros(rtt_length)
 
-def main(test_name, plotting=True, threshold = 18, slice = (60, 0), compare = False):
+    for i in range(rtt_length):
+        window[i % window_size] = rtt[i]
+        mean = np.mean(window)
+        std = np.std(window)
+        z_score[i] = (10*(rtt[i]-mean)/std)
+    return z_score
+
+def main(test_name, plotting=True, threshold = 21, slice = (0, 0), compare = False, relative_time = False):
     compare_arr = np.zeros(1)
-    
-    path = f"{Path.home()}/P7-Starlink-TCP/Project/kernel_cca/{test_name}/"
-    """     
-    if Path(path + "test.npy").exists() and Path(path + "test_crc.npy").exists():
-        data_matrix = load_data(test_name)
-    else:
-        data_matrix = process_data(test_name)
-        save_data(test_name, data_matrix) """
     
     data_matrix = process_data(test_name)
     if compare:
-        compare_arr = compare_z(data_matrix[:,1], 400)
-        
+        compare_arr = compare_z_normal(data_matrix[:,1], 40000)
+    
 
     if plotting:
-        plot_data(data_matrix, threshold, slice[0], slice[1], compare_arr, test_name)
+        plot_data(data_matrix, threshold, slice[0], slice[1], compare_arr, relative_time=relative_time)
 
 
 #test_name = sys.argv[1]
 test_name = "cubic_z_score_e"
-main(test_name, compare=True)
+main(test_name, compare=False, relative_time=True)
 
