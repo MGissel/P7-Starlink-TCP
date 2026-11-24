@@ -1,3 +1,4 @@
+import socket
 import subprocess
 import threading
 
@@ -6,19 +7,25 @@ class SocketReader:
     """Run the bpftrace probe and split its output into a TCP and a CUBIC log file."""
 
     def __init__(self, script="tcp_sock_probe.bt",
-                 tcp_file="tcp.log", cubic_file="cubic.log"):
+                 tcp_file="tcp.log", cubic_file="cubic.log", port=5201):
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Invalid iperf port: {port}")
+
         self._tcp = open(tcp_file, "w")
         self._cubic = open(cubic_file, "w")
         self._cubic_header_written = False
+        self.tcp_samples = 0
         self._attached = threading.Event()
 
         self._proc = subprocess.Popen(
-            ["sudo", "-n", "bpftrace", "-q", "-B", "line", script],
+            [
+                "sudo", "-n", "bpftrace", "-q", "-B", "line", script,
+                str(socket.htons(port)),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         self._thread = threading.Thread(target=self._split_output, daemon=True)
         self._thread.start()
@@ -46,6 +53,7 @@ class SocketReader:
                 self._cubic.write(cols[1] + " " + " ".join(value for _, value in fields) + "\n")
             elif cols[0].isdigit():                   # TCP state line
                 self._tcp.write(line)
+                self.tcp_samples += 1
         self._attached.set()                          # bpftrace exited: stop waiting
 
     def stop(self):

@@ -1,5 +1,6 @@
 import configparser
 import json
+import subprocess
 import time
 from contextlib import ExitStack
 from datetime import datetime, timedelta
@@ -225,6 +226,8 @@ def main() -> None:
         experiment.upload_from_files()
         return
 
+    # Authenticate before setup; background helpers use sudo -n.
+    subprocess.run(["sudo", "-v"], check=True)
     network = setup_network_and_theaterq()
 
     PROBE_DIR.mkdir(exist_ok=True)

@@ -4,13 +4,13 @@ import time
 class KernelLog:
     def __init__(self, log_file, level="debug"):
         self._file = open(log_file, "w")
+        # Keep the caller's TTY so sudo can use the authentication from startup.
         self._proc = subprocess.Popen(
             ["sudo", "-n", "dmesg", "-k", "-W", "-l", level],
             stdin=subprocess.DEVNULL,
             stdout=self._file,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
 
         time.sleep(0.2)
