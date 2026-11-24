@@ -67,11 +67,19 @@ static u32 cube_rtt_scale __read_mostly;
 static u32 beta_scale __read_mostly;
 static u64 cube_factor __read_mostly;
 
+//Sample to mean ratio calc 
 #define WINDOW_SIZE (400)
-#define RESTORE_RANGE (400)
-#define SCORE_THRESHOLD (21)
-#define LOSS_TRESHOLD (2)
+#define SCORE_THRESHOLD (16)
 #define CLAMP(x, high) (((x) > (high)) ? (high) : (x))
+
+//detection restore interval 
+#define RESTORE_BEFORE (1*HZ) //Restore if handover is detected within 1s of loss event 
+#define RESTORE_AFTER (1*HZ) //Restore if loss event happens within 1s of handover detection
+
+//Ignore settings 
+#define RESTORE_RANGE (400)
+#define IGNORE_INTERVAL (5*HZ) //5 secs 
+#define LOSS_THRESHOLD (2)
 
 
 /* Note parameters that are used for precomputing scale factors are read-only */
@@ -116,11 +124,11 @@ struct bictcp {
 	u32	last_ack;	/* last time when the ACK spacing is close */
 	u32	curr_rtt;	/* the minimum rtt of current round */
 	u16 counter;
-	u16 thresh_counter;
-	u16 loss_event_timer;
 	u32 moving_mean;
-	u16 cwnd_max_counter[2];
-	u16 loss_counter[2];
+	u32 cwnd_max_counter[2];
+	u32 loss_counter[2];
+	u32 before_interval; //Need to use better name, as it becomes end instead of start 
+	u32 after_interval;  //Need to use better name, as it becomes end instead of start 
 };
 
 static inline void bictcp_reset(struct bictcp *ca)
@@ -150,7 +158,10 @@ __bpf_kfunc static void cubictcp_init(struct sock *sk)
 	struct bictcp *ca = inet_csk_ca(sk);
 
 	bictcp_reset(ca);
-	//memset(ca->cwnd_max_counter,0,sizeof(ca->cwnd_max_counter))
+
+	//Init arrays to zero, other var should be 0
+	memset(ca->cwnd_max_counter,0,sizeof(ca->cwnd_max_counter));
+	memset(ca->loss_counter,0,sizeof(ca->loss_counter));
 
 
 	if (hystart)
@@ -349,40 +360,37 @@ __bpf_kfunc static void zscore_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	
 	
 	ca->counter = CLAMP(ca->counter+1, WINDOW_SIZE);
-	ca->loss_event_timer = CLAMP(ca->loss_event_timer + 1, WINDOW_SIZE+1);
-	ca->thresh_counter = CLAMP(ca->thresh_counter + 1, WINDOW_SIZE+1);
-	ca->cwnd_max_counter[1] += 1;
-	ca->loss_counter[1] +=1;
-	//tp->rack.rtt_us
-	//tp->srtt_us
+	
 	ca->moving_mean = (tp->rack.rtt_us + CLAMP(ca->counter-1, WINDOW_SIZE-1)*(u64)ca->moving_mean) / ca->counter;
 
 
-	u32 curr_z = (10*(u64)tp->rack.rtt_us)/ca->moving_mean;
+	u32 score = (10*(u64)tp->rack.rtt_us)/ca->moving_mean;
 	
 
-	if (curr_z >= SCORE_THRESHOLD){
-		ca->thresh_counter = 0;
+	if (score >= SCORE_THRESHOLD){
+		ca->after_interval = tcp_jiffies32 + RESTORE_AFTER;
 	}
 	
 	//If we exceed the z_score threshold shortly after a loss event. 
-	if (curr_z >= SCORE_THRESHOLD && ca->loss_event_timer < RESTORE_RANGE && tcp_snd_cwnd(tp)< max(ca->cwnd_max_counter[0], tp->prior_cwnd)){
+	if (score >= SCORE_THRESHOLD && ca->before_interval > (tcp_jiffies32) && tcp_snd_cwnd(tp)< max(ca->cwnd_max_counter[0], tp->prior_cwnd)){
 		tp->snd_cwnd = max(ca->cwnd_max_counter[0], tp->prior_cwnd);
 	}
 
-	if (ca->cwnd_max_counter[1] > RESTORE_RANGE){
+	//Logic to determine max cwnd in current slot
+	if (ca->cwnd_max_counter[1] < tcp_jiffies32){
 		ca->cwnd_max_counter[0] = 0; //reset cwnd as we might not yet have a new prior cwnd
-		ca->cwnd_max_counter[1] = 0; //Reset counter 
+		ca->cwnd_max_counter[1] = tcp_jiffies32+RESTORE_BEFORE; //Reset counter 
 	}
 
-	if (ca->loss_counter[1] > RESTORE_RANGE){ //Might replace the range with something elese in the future 
+	//ignore a set number of loss events 
+	if (ca->loss_counter[1] < tcp_jiffies32){ 
 		ca->loss_counter[0] = 0; //Reset number of loss events
-		ca->loss_counter[1] = 0; //Reset counter 
+		ca->loss_counter[1] = tcp_jiffies32+IGNORE_INTERVAL; //Reset counter 
 	}
 
 
-	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%u, thresh_counter_before,%u, thresh_range_before,%u, thresh_counter_after,%u, thresh_range_after,%d, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, prior_cwnd,%u, array[%u,%u]", 
-		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), curr_z, ca->thresh_counter, (ca->thresh_counter < WINDOW_SIZE), ca->loss_event_timer, curr_z >= SCORE_THRESHOLD && ca->loss_event_timer < WINDOW_SIZE, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, tp->prior_cwnd, ca->cwnd_max_counter[0], ca->cwnd_max_counter[1]);
+	printk(KERN_DEBUG ", RTT: ,%u, L_CWND ,%u, C_CWND ,%u, z_scores,%u, cnt,%u, lmc,%u, ltime,%u, bic_origin_point,%u, k,%u, delay_min,%u, epoch_start,%u, ack_cnt,%u, prior_cwnd,%u, array[%u,%u]", 
+		tp->rack.rtt_us, ca->last_cwnd, tcp_snd_cwnd(tp), score, ca->cnt, ca->last_max_cwnd, ca->last_time, ca->bic_origin_point,ca->bic_K, ca->delay_min, ca->epoch_start,ca->ack_cnt, tp->prior_cwnd, ca->cwnd_max_counter[0], ca->cwnd_max_counter[1]);
 
 	if (!tcp_is_cwnd_limited(sk))
 		return;
@@ -403,24 +411,24 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct bictcp *ca = inet_csk_ca(sk);
 
-	if (ca->thresh_counter < WINDOW_SIZE){
+	if (ca->after_interval > tcp_jiffies32){
 		return tp->prior_cwnd;
 	}
 
 	else {
 		//Checks if number of loss events 
 		ca->loss_counter[0] +=1;
-		if (ca->loss_counter[0] < LOSS_TRESHOLD){
+		if (ca->loss_counter[0] < LOSS_THRESHOLD){
 			return tp->prior_cwnd;
 		}
 
 		//Check if last max window is larger than current min in cwnd matrix 
 		if ((tp->prior_cwnd > ca->cwnd_max_counter[0])){
 			ca->cwnd_max_counter[0] = tp->prior_cwnd; //set to prior cwnd
-			ca->cwnd_max_counter[1] = 0; //Reset counter 
+			ca->cwnd_max_counter[1] = tcp_jiffies32+RESTORE_BEFORE;
 		}
 
-		ca->loss_event_timer = 0;
+		ca->before_interval = tcp_jiffies32 + RESTORE_BEFORE; //Current time + interval it can be restored in 
 		//ca->epoch_start_max = ca->epoch_start;
 		ca->epoch_start = 0;	/* end of epoch */ //Tells update to recalc a new bic_target
 		/* Wmax and fast convergence */
@@ -436,7 +444,7 @@ __bpf_kfunc static u32 cubictcp_recalc_ssthresh(struct sock *sk)
 __bpf_kfunc static void cubictcp_state(struct sock *sk, u8 new_state)
 {
 	struct bictcp *ca = inet_csk_ca(sk);
-	if (new_state == TCP_CA_Loss && (ca->thresh_counter > WINDOW_SIZE) && (ca->loss_counter[0] > LOSS_TRESHOLD)) {
+	if (new_state == TCP_CA_Loss && (ca->after_interval <= tcp_jiffies32) && (ca->loss_counter[0] >= LOSS_THRESHOLD)) {
 		bictcp_reset(inet_csk_ca(sk));
 		bictcp_hystart_reset(sk);
 	}
