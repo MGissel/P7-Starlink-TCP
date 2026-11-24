@@ -1,4 +1,6 @@
-obj-m += test12.o
+NAME ?= cubic
+obj-m += $(NAME).o
+
 PWD := $(CURDIR)
 
 
